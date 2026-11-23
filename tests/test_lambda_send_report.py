@@ -17,6 +17,15 @@ _HANDLER_PATH = (
     Path(__file__).resolve().parents[1] / "lambda" / "send_report" / "handler.py"
 )
 
+# The ``lambda/`` deployment code is intentionally kept out of the published
+# repository (see .gitignore), so it is absent on a fresh clone / in CI. These
+# tests exercise that handler directly, so skip the whole module when it is not
+# present instead of erroring on the missing file.
+pytestmark = pytest.mark.skipif(
+    not _HANDLER_PATH.exists(),
+    reason="lambda/send_report/handler.py is not part of this checkout",
+)
+
 
 def _load_handler():
     spec = importlib.util.spec_from_file_location("wily_send_report_handler", _HANDLER_PATH)
