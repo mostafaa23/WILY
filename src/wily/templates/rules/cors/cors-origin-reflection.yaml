@@ -1,0 +1,58 @@
+id: cors-origin-reflection
+info:
+  name: "CORS misconfiguration: origin reflection with credentials"
+  severity: critical
+  # Mirrors the category emitted by scanners/authz_bypass.py's
+  # CorsMisconfigScanner, so a YAML-driven match and the code-driven match
+  # dedupe against each other instead of being reported twice.
+  category: authz-bypass-cors-origin-reflection
+  description: >
+    Sends a forged Origin header and flags the server when it reflects that
+    exact origin back in Access-Control-Allow-Origin together with
+    Access-Control-Allow-Credentials: true. That combination lets any
+    malicious site read authenticated responses (the victim's data plus
+    their cookies) cross-origin.
+
+asset-type: http-endpoint
+
+# Collapse with CorsMisconfigScanner's finding (same technique) so the same
+# issue is not reported twice when both run under `wily scan --rules`.
+dedup-technique: cors_origin_reflection
+
+authorization:
+  mode: passive
+  requires-tenant-pair: false
+  requires-owned-infra: false
+
+# A domain that is not a real relying party at all: if it comes back
+# reflected, the server is echoing arbitrary client origins.
+variables:
+  probe_origin: "https://evil-wily-probe.invalid"
+
+request:
+  - method: GET
+    path: "{{BaseURL}}"
+    headers:
+      Origin: "{{probe_origin}}"
+
+matchers-condition: and
+matchers:
+  # The response must reflect the exact forged origin...
+  - type: word
+    part: header
+    words:
+      - "Access-Control-Allow-Origin: {{probe_origin}}"
+  # ...AND allow credentials, which is what makes reflection dangerous.
+  - type: word
+    part: header
+    words:
+      - "Access-Control-Allow-Credentials: true"
+
+evidence:
+  - response_headers
+
+remediation: >
+  Use an explicit, fixed allow-list of trusted origins instead of reflecting
+  arbitrary client-provided origins. Access-Control-Allow-Credentials: true
+  must only ever be paired with a specific, validated origin - never a
+  reflected value and never the "*" wildcard.

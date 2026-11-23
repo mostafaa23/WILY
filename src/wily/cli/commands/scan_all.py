@@ -1,0 +1,1291 @@
+"""The unified orchestrator: ``wily scan <domain>``.
+
+Runs Auth Bypass and SSRF levels 1+2 automatically against every endpoint
+it discovers. JWT Tampering, BOLA, IAM Privesc, and blind SSRF (level 4)
+each enable themselves once their required input is supplied (--token,
+--identity, --iam-file, --blind respectively).
+
+Safety gates: destructive-method auth-bypass testing needs
+--confirm-destructive; SSRF/IMDS needs --confirm-owned-infra, since it
+must only target infrastructure the tester owns.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import re
+from pathlib import Path
+from urllib.parse import urlparse
+
+from rich.console import Console
+from rich.table import Table
+
+from wily.core.oob_canary import OOBCanaryServer
+from wily.core.oob_interaction import ExternalOOBClient
+from wily.core.rate_limiter import AdaptiveRateLimiter
+from wily.core.scope_manager import (
+    ScopeError,
+    ScopeManager,
+    extract_bucket_name,
+    load_scope_config,
+)
+from wily.recon.api_discovery import (
+    ApiDiscoveryPipeline,
+    DiscoveryConfig,
+    DiscoveryReport,
+)
+from wily.recon.cloud_enum import (
+    azure_account_name,
+    generate_candidates,
+    keyword_from_domain,
+    load_mutations,
+)
+from wily.recon.live_filter import filter_live_assets
+from wily.recon.parameter_discovery import (
+    ParameterDiscoveryConfig,
+    discover_parameters,
+    select_ssrf_candidates,
+)
+from wily.recon.token_harvest import harvest_tokens, redact_jwt
+from wily.recon.traffic_import import ImportedTraffic, import_traffic
+from wily.report.html_report import export_html
+from wily.report.json_report import export_json
+from wily.report.sarif_report import export_sarif
+from wily.risk.ml.dedup import cluster_by_endpoint_hash, deduplicate
+from wily.risk.ml.feedback import FeedbackStore
+from wily.risk.ml.model import load_triage_model
+from wily.risk.ml.ranker import rank_findings
+from wily.risk.rules_engine import apply_deterministic_rules
+from wily.risk.scoring import compute_risk_score
+from wily.risk.triggers import TriggerContext, derive_followups
+from wily.scanners.authz_bypass import (
+    AuthzBypassScanner,
+    AuthzBypassTarget,
+    CorsMisconfigScanner,
+    CorsMisconfigTarget,
+)
+from wily.scanners.base import Finding, ScannerConfirmationError, run_scanner
+from wily.scanners.bola import BolaTester, Identity
+from wily.scanners.cloud_storage import CloudStorageScanner, CloudStorageTarget
+from wily.scanners.http_engine import HttpEngine
+from wily.scanners.iam_privesc import (
+    build_privesc_graph,
+    filter_principals_in_scope,
+    find_privesc_paths,
+    load_authorization_details,
+)
+from wily.scanners.jwt_secret import build_weak_hs256_finding, recover_hs256_secret
+from wily.scanners.jwt_tamper import JwtTamperScanner, JwtTarget
+from wily.scanners.rule_scanner import RuleScanner, RuleScanTarget
+from wily.scanners.s3_bucket import S3BucketScanner, S3BucketTarget, s3_host_for
+from wily.scanners.secret_scan import (
+    SecretScanScanner,
+    SecretScanTarget,
+    SecretSource,
+)
+from wily.scanners.ssrf_imds import SsrfImdsScanner, SsrfImdsTarget
+from wily.scanners.takeover import TakeoverScanner, TakeoverTarget
+from wily.templates.loader import load_rules
+
+console = Console(stderr=True)
+
+
+def _want_canary(*, blind: bool, auto_canary: bool, confirm_owned_infra: bool) -> bool:
+    """Decide whether to stand up the OOB canary for this run.
+
+    ``--blind`` forces it on (explicit override, even with ``--no-auto-canary``).
+    Otherwise it auto-starts when ``--auto-canary`` is on AND the SSRF/IMDS
+    module itself is enabled (``confirm_owned_infra``) - there is no point
+    running a canary when the scanner that would use it is skipped, and gating
+    on the same flag keeps the canary from ever widening the scan's reach
+    beyond what SSRF already does.
+    """
+    return blind or (auto_canary and confirm_owned_infra)
+
+
+def _start_oob_canary() -> tuple[OOBCanaryServer | None, OSError | None]:
+    """Start a local OOB canary, returning ``(canary, None)`` on success or
+    ``(None, error)`` when the listener cannot bind - so the caller falls back
+    cleanly to the pre-auto behavior (no canary, no blind SSRF) instead of
+    crashing."""
+    try:
+        return OOBCanaryServer(), None
+    except OSError as exc:
+        return None, exc
+
+
+def _parse_bind(bind: str | None) -> tuple[str, int]:
+    """Parse ``--oob-bind`` (``HOST``, ``HOST:PORT`` or ``:PORT``) into a
+    ``(host, port)`` pair. Defaults to ``0.0.0.0:0`` (all interfaces, OS-chosen
+    port) so a bare ``--oob-public-url`` still binds a reachable listener."""
+    if not bind or not bind.strip():
+        return "0.0.0.0", 0
+    raw = bind.strip()
+    if ":" in raw:
+        host, _, port_s = raw.rpartition(":")
+        host = host or "0.0.0.0"
+        try:
+            port = int(port_s) if port_s else 0
+        except ValueError:
+            port = 0
+        return host, port
+    return raw, 0
+
+
+def _build_oob_interaction(
+    *, oob_server: str | None, oob_bind: str | None, oob_public_url: str | None
+) -> tuple[object | None, Exception | None, str]:
+    """Pick and build the OOB backend for this run, returning
+    ``(interaction, error, how_label)``.
+
+    Precedence (all opt-in; the default stays the loopback canary):
+      1. ``--oob-server`` -> a pluggable :class:`ExternalOOBClient` that polls a
+         user-supplied interactsh-compatible server (works for remote targets,
+         no inbound listener needed).
+      2. ``--oob-bind`` / ``--oob-public-url`` -> a self-hosted canary bound to
+         a reachable interface and advertising the public URL (remote targets).
+      3. neither -> the loopback canary, exactly as before.
+    """
+    if oob_server:
+        try:
+            client = ExternalOOBClient(
+                oob_server, interaction_domain=oob_public_url or oob_server
+            )
+            return client, None, f"external interaction server {client.base_url}"
+        except Exception as exc:  # bad URL etc.; fall back cleanly
+            return None, exc, "external"
+    if oob_bind or oob_public_url:
+        host, port = _parse_bind(oob_bind)
+        try:
+            canary = OOBCanaryServer(host=host, port=port, public_base_url=oob_public_url)
+            return canary, None, f"self-hosted canary (bound {host}:{port}) at {canary.base_url}"
+        except OSError as exc:
+            return None, exc, "self-hosted"
+    canary, error = _start_oob_canary()
+    label = f"loopback canary at {canary.base_url}" if canary else "loopback"
+    return canary, error, label
+
+
+def read_targets_file(path: str | Path) -> list[str]:
+    """Parse a targets file: one domain per line.
+
+    Blank lines and lines whose first non-whitespace character is ``#`` (full-line
+    comments) are ignored. Surrounding whitespace is stripped from each entry.
+    Order is preserved. Raises ``OSError`` if the file cannot be read.
+    """
+    targets: list[str] = []
+    for line in Path(path).read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        targets.append(stripped)
+    return targets
+
+
+def collect_targets(
+    domains: list[str] | None, targets_file: str | Path | None
+) -> list[str]:
+    """Combine positional domains and a ``--targets-file`` into one ordered,
+    de-duplicated target list.
+
+    Positional args come first, then file entries; the first occurrence of each
+    domain wins and later duplicates are dropped (dedup is on the trimmed string).
+    """
+    combined: list[str] = list(domains or [])
+    if targets_file:
+        combined += read_targets_file(targets_file)
+
+    seen: set[str] = set()
+    result: list[str] = []
+    for raw in combined:
+        target = raw.strip()
+        if not target or target in seen:
+            continue
+        seen.add(target)
+        result.append(target)
+    return result
+
+
+def sanitize_domain_filename(domain: str) -> str:
+    """Filesystem-safe base name for a domain's report file.
+
+    Strips any URL scheme, lowercases, and replaces every character outside
+    ``[a-z0-9.-]`` with ``_`` so the result is a safe file stem on any OS.
+    """
+    name = domain
+    if "://" in name:
+        name = urlparse(name).hostname or name
+    name = name.strip().lower()
+    name = re.sub(r"[^a-z0-9.\-]", "_", name)
+    name = name.strip("._-")
+    return name or "target"
+
+
+async def run_scans(
+    *,
+    targets: list[str],
+    output: str,
+    output_dir: str | None = None,
+    **scan_kwargs,
+) -> dict[str, list]:
+    """CLI-facing orchestrator: scan one or more domains, one report per domain.
+
+    Returns a map of domain label -> that domain's post-triage findings, so the
+    caller can apply a CI gate (``--fail-on``) over the same findings the
+    reports contain.
+
+    Backward compatibility is the design constraint:
+      * No targets (e.g. ``--iam-file`` alone) -> a single legacy run with the
+        ``-o`` output path and ``domain=None``.
+      * Exactly one target and no ``--output-dir`` -> a single legacy run writing
+        to the ``-o`` path, byte-for-byte identical to the old single-domain flow.
+      * Multiple targets, or ``--output-dir`` given -> each domain is scanned
+        sequentially into its OWN report at ``<output_dir>/<sanitized-domain>.json``
+        (plus ``.html``/``.sarif`` siblings when ``--format`` asks). Each domain is
+        its own scope root, because every ``run_full_scan`` call builds a fresh
+        ScopeManager, so findings never bleed across domains.
+    """
+    # No domain at all (IAM/Burp/HAR-only): preserve the legacy single-call path.
+    if not targets:
+        findings = await run_full_scan(domain=None, output=output, **scan_kwargs)
+        return {"target": findings or []}
+
+    # Single target, no explicit output dir: EXACT legacy behavior.
+    if len(targets) == 1 and not output_dir:
+        findings = await run_full_scan(domain=targets[0], output=output, **scan_kwargs)
+        return {targets[0]: findings or []}
+
+    # Multi-domain (or single-domain-into-a-dir): one report file per domain.
+    out_dir = Path(output_dir) if output_dir else Path(output).resolve().parent
+    out_dir.mkdir(parents=True, exist_ok=True)
+    console.print(
+        f"[cyan][*][/cyan] Scanning {len(targets)} target(s) sequentially; "
+        f"one report per domain in [bold]{out_dir.resolve()}[/bold]."
+    )
+
+    results: dict[str, list] = {}
+    used_names: set[str] = set()
+    for index, domain in enumerate(targets, start=1):
+        # Resolve a unique per-domain base name (guard against two inputs that
+        # sanitize to the same stem, e.g. "a.com" and "https://a.com/").
+        stem = sanitize_domain_filename(domain)
+        candidate = stem
+        suffix = 2
+        while candidate in used_names:
+            candidate = f"{stem}-{suffix}"
+            suffix += 1
+        used_names.add(candidate)
+
+        per_domain_output = out_dir / f"{candidate}.json"
+        console.print(
+            f"\n[bold cyan]=== [{index}/{len(targets)}] {domain} ===[/bold cyan]"
+        )
+        findings = await run_full_scan(
+            domain=domain, output=str(per_domain_output), **scan_kwargs
+        )
+        results[domain] = findings or []
+        console.print(
+            f"[green][+][/green] {domain}: report written under "
+            f"[bold]{per_domain_output.resolve()}[/bold]."
+        )
+
+    return results
+
+
+async def run_full_scan(
+    domain: str,
+    token: str | None,
+    identities_raw: list[str],
+    iam_file: str | None,
+    allow_local: bool,
+    blind: bool,
+    output: str,
+    auto_token: bool = True,
+    auto_canary: bool = True,
+    report_formats: list[str] | None = None,
+    confirm_destructive: bool = True,
+    confirm_owned_infra: bool = True,
+    confirm_s3_writes: bool = False,
+    probe_live: bool = False,
+    cloud_enum: bool = False,
+    cloud_keywords: list[str] | None = None,
+    cloud_enum_wordlist: str | None = None,
+    cloud_enum_max: int = 300,
+    show_leak: bool = False,
+    burp_xml: str | None = None,
+    import_har: str | None = None,
+    scope_buckets: list[str] | None = None,
+    scope_accounts: list[str] | None = None,
+    scope_config: str | None = None,
+    feedback_store: str | None = None,
+    use_rules: bool = False,
+    jwt_secret_wordlist: str | None = None,
+    oob_server: str | None = None,
+    oob_bind: str | None = None,
+    oob_public_url: str | None = None,
+    ml_model: str | None = None,
+) -> list:
+    all_findings: list = []
+
+    # Optional extra wordlist for the weak-HS256-secret check. Loaded once,
+    # one candidate per non-blank line; a bad path is a warning, not a failure.
+    extra_jwt_secrets: list[str] = []
+    if jwt_secret_wordlist:
+        try:
+            extra_jwt_secrets = [
+                line.strip()
+                for line in Path(jwt_secret_wordlist).read_text(encoding="utf-8").splitlines()
+                if line.strip() and not line.lstrip().startswith("#")
+            ]
+            console.print(
+                f"[cyan][*][/cyan] JWT weak-secret: +{len(extra_jwt_secrets)} candidate(s) "
+                f"from {jwt_secret_wordlist}."
+            )
+        except OSError as e:
+            console.print(f"[yellow][!][/yellow] --jwt-secret-wordlist ignored: {e}")
+
+    # --- Declarative YAML rules (opt-in). Loaded once; run per endpoint
+    # alongside the code scanners when --rules is passed. Off by default, so
+    # the existing code-based pipeline is byte-for-byte unchanged without it.
+    yaml_rules = load_rules() if use_rules else []
+    if use_rules:
+        console.print(
+            f"[cyan][*][/cyan] YAML rules: {len(yaml_rules)} loaded "
+            "(--rules); run alongside the code scanners."
+        )
+
+    # --- Resolve the extended scope (buckets + AWS accounts) from CLI/config.
+    buckets: tuple[str, ...] = tuple(scope_buckets or ())
+    accounts: tuple[str, ...] = tuple(scope_accounts or ())
+    excluded: tuple[str, ...] = ()
+    if scope_config:
+        try:
+            cfg = load_scope_config(scope_config)
+            buckets += cfg["buckets"]
+            accounts += cfg["accounts"]
+            excluded += cfg["exclude"]
+        except (ScopeError, OSError) as e:
+            console.print(f"[yellow][!][/yellow] Scope config ignored: {e}")
+    if buckets:
+        console.print(f"[cyan][*][/cyan] S3 bucket scope: {', '.join(buckets)}")
+    if accounts:
+        console.print(f"[cyan][*][/cyan] AWS account scope: {', '.join(accounts)}")
+
+    # --- Hybrid input: parse any imported traffic (offline - no replay).
+    imported: ImportedTraffic | None = None
+    if burp_xml or import_har:
+        imported = import_traffic(burp_xml=burp_xml, har=import_har)
+        console.print(
+            f"[cyan][*][/cyan] Imported traffic: {len(imported.endpoints)} endpoint(s), "
+            f"{len(imported.tokens)} token(s), {len(imported.s3_links)} S3 link(s)."
+        )
+        for err in imported.errors:
+            console.print(f"[yellow][!][/yellow] Traffic import: {err}")
+        # Seed the JWT --token path from an observed bearer token when the user
+        # did not supply one explicitly.
+        if not token and imported.jwt_tokens:
+            token = imported.jwt_tokens[0]
+            console.print("[cyan][*][/cyan] JWT: seeded --token from imported bearer token.")
+
+    if iam_file:
+        console.print(f"[cyan][*][/cyan] IAM: analyzing {iam_file} ...")
+        try:
+            principals = load_authorization_details(Path(iam_file))
+            if accounts:
+                before = len(principals)
+                principals = filter_principals_in_scope(principals, accounts)
+                if len(principals) < before:
+                    console.print(
+                        f"[cyan][*][/cyan] IAM: {before - len(principals)} principal(s) "
+                        "dropped as out-of-account-scope."
+                    )
+            graph = build_privesc_graph(principals)
+            iam_findings = find_privesc_paths(graph, principals)
+            all_findings += iam_findings
+            console.print(f"[cyan][*][/cyan] IAM: {len(iam_findings)} finding(s).")
+        except Exception as e:
+            # A malformed/partial authorization-details file (missing keys,
+            # bad JSON) must not abort the whole scan - skip IAM and continue
+            # with the rest of the modules.
+            console.print(f"[yellow][!][/yellow] IAM analysis skipped: {e}")
+
+    # When no domain was supplied but imported traffic carried endpoints, adopt
+    # the first imported endpoint's host as the scan target so those endpoints
+    # can be scanned. Active discovery is skipped in that case (the tester chose
+    # import mode, not "go probe this live target").
+    user_supplied_domain = bool(domain)
+    if not domain and imported and imported.endpoints:
+        first_host = urlparse(imported.endpoints[0]).hostname
+        if first_host:
+            domain = first_host
+            console.print(
+                f"[cyan][*][/cyan] No domain given; scoping to imported host [bold]{first_host}[/bold]."
+            )
+
+    if not domain:
+        return _finish(all_findings, output, show_leak, report_formats, feedback_store, ml_model)
+
+    if domain.startswith("http"):
+        target_url = domain
+    else:
+        scheme = "http" if allow_local else "https"
+        target_url = f"{scheme}://{domain}"
+
+    root_domain = urlparse(target_url).hostname or domain
+
+    # One ScopeManager, one rate limiter, one HttpEngine for the entire
+    # scan: every scanner below shares them, so the AdaptiveRateLimiter's
+    # per-host backoff state (e.g. after a 429) carries across scanners
+    # and endpoints instead of resetting on every single call.
+    scope = ScopeManager(
+        root_domain,
+        allow_local_targets=allow_local,
+        excluded_hosts=excluded,
+        s3_buckets=buckets,
+        aws_accounts=accounts,
+    )
+    rate_limiter = AdaptiveRateLimiter()
+    http_engine = HttpEngine(scope_manager=scope, rate_limiter=rate_limiter)
+
+    # A DiscoveryReport always exists so BOLA (which consumes the report
+    # object) has one to work with, even in pure import mode.
+    report = DiscoveryReport(target=target_url)
+    endpoints: list[str] = []
+    if user_supplied_domain:
+        console.print(f"[cyan][*][/cyan] Discovering endpoints on [bold]{target_url}[/bold] ...")
+        # Offensive-by-default discovery: run every stage (docs + JS + fuzz)
+        # regardless of early hits (aggressive) and sweep the full SecLists-
+        # derived wordlist (deep_fuzz), so protected targets that return few
+        # obvious endpoints still get a thorough pass instead of "0 endpoints".
+        disc_config = DiscoveryConfig(
+            target=target_url,
+            scope=scope,
+            allow_local_targets=allow_local,
+            aggressive=True,
+            deep_fuzz=True,
+        )
+        report = await ApiDiscoveryPipeline(disc_config).run()
+        payload = report.to_json()
+        endpoints = list(payload.get("endpoints", []))
+        console.print(f"[cyan][*][/cyan] {len(endpoints)} endpoint(s) discovered.")
+
+    # Merge in imported endpoints that fall inside the authorized scope. They
+    # are added to the same per-endpoint queue the scanners loop over below
+    # (and into the report so BOLA sees them too); out-of-scope ones are
+    # dropped (and reported) rather than scanned.
+    if imported and imported.endpoints:
+        seen = set(endpoints)
+        kept = dropped = 0
+        for ep in imported.endpoints:
+            if not scope.is_in_scope(ep):
+                dropped += 1
+                continue
+            report.add_endpoint(ep, source="traffic_import")
+            if ep not in seen:
+                endpoints.append(ep)
+                seen.add(ep)
+                kept += 1
+        console.print(
+            f"[cyan][*][/cyan] Imported endpoints added to queue: {kept}"
+            + (f" ({dropped} out-of-scope, skipped)" if dropped else "")
+        )
+
+    # --- Live-asset filtering (Phase 4, HTTPX-style). Before any expensive
+    # scanner runs, collapse exact + near-identical endpoints (same route with a
+    # different object id) and, optionally, drop endpoints that don't answer a
+    # cheap liveness probe. Dedup is always free; the probe is opt-in
+    # (--probe-live) and goes through the shared, scope-enforcing HttpEngine. ---
+    if endpoints:
+        before = len(endpoints)
+        lf = filter_live_assets(
+            endpoints,
+            scope=scope,
+            http_engine=http_engine if probe_live else None,
+            probe=probe_live,
+        )
+        endpoints = lf.kept
+        if lf.dropped:
+            summary = []
+            if lf.collapsed:
+                summary.append(f"{lf.collapsed} duplicate")
+            if lf.out_of_scope:
+                summary.append(f"{len(lf.out_of_scope)} out-of-scope")
+            if lf.dead:
+                summary.append(f"{len(lf.dead)} dead")
+            console.print(
+                f"[cyan][*][/cyan] Live-asset filter: {before} -> {len(endpoints)} "
+                f"target(s) ({', '.join(summary)} dropped)."
+            )
+
+    # --- JWT token auto-harvest (default-on, passive, READ-ONLY). When the
+    # user did not pass --token, do a bounded GET-only pass over the in-scope
+    # endpoints already discovered and pull any JWT the target itself exposes
+    # (login response body, Set-Cookie, an echoed auth header, a JS bundle),
+    # then seed --token with it so the JWT Tampering module runs automatically.
+    # An explicit --token always wins; --no-auto-token opts out. Detection
+    # reuses the shared validator in recon/traffic_import (is_valid_jwt), so a
+    # dotted non-JWT string is never mistaken for a token. The raw token is
+    # never printed - only a redacted alg/length label and the source.
+    if not token and auto_token and endpoints:
+        try:
+            harvested = await asyncio.to_thread(
+                harvest_tokens, target_url, endpoints, scope, http_engine
+            )
+        except Exception as e:  # harvesting must never abort a scan
+            harvested = []
+            console.print(f"[yellow][!][/yellow] JWT auto-harvest skipped: {e}")
+        if harvested:
+            token = harvested[0].token
+            console.print(
+                f"[cyan][*][/cyan] JWT: auto-harvested {redact_jwt(token)} from "
+                f"{harvested[0].source} - enabling JWT Tampering checks "
+                "(pass --no-auto-token to disable)."
+            )
+            if len(harvested) > 1:
+                console.print(
+                    f"[cyan][*][/cyan] JWT: {len(harvested)} token(s) harvested; "
+                    "using the first, the rest are available for manual --token."
+                )
+
+    # --- Weak HS256 secret (local, bounded, networkless). Run ONCE here (not
+    # per endpoint) because a guessable signing secret is a property of the
+    # token, not of any one endpoint - otherwise the same finding would repeat
+    # for every endpoint the JWT scanner touches. The per-endpoint JWT targets
+    # below set check_weak_secret=False so only this central pass emits it.
+    if token:
+        try:
+            secret_result = recover_hs256_secret(token, extra_wordlist=extra_jwt_secrets)
+            if secret_result.recovered:
+                all_findings.append(
+                    build_weak_hs256_finding(target_url, token, secret_result)
+                )
+                console.print(
+                    "[red][!][/red] JWT: HS256 signing secret is WEAK — recovered "
+                    f"from a bounded wordlist in {secret_result.attempts} attempt(s) "
+                    "(value redacted). This lets anyone forge valid tokens."
+                )
+        except Exception as e:  # never abort a scan over the local crack
+            console.print(f"[yellow][!][/yellow] JWT weak-secret check skipped: {e}")
+
+    # Track which (scanner, asset) pairs ran, so the finding-driven follow-up
+    # step never re-runs the same test. Defined before the cloud scanners below
+    # so they can register into it too.
+    scanned: set[tuple[str, str]] = set()
+
+    # --- Cloud scanners (S3 misconfig, secrets, takeover). These are not tied
+    # to the per-endpoint API loop: S3 runs off bucket references, secrets off
+    # discovered JS + imported traffic, takeover off discovered hosts. They run
+    # even when no API endpoints were found (e.g. a pure bucket-scope scan). ---
+    s3_scan_targets: dict[str, tuple] = {}  # asset -> (engine, target) for follow-ups
+    await _run_cloud_scanners(
+        all_findings=all_findings,
+        scanned=scanned,
+        s3_scan_targets=s3_scan_targets,
+        endpoints=endpoints,
+        imported=imported,
+        buckets=buckets,
+        root_domain=root_domain,
+        scope=scope,
+        http_engine=http_engine,
+        rate_limiter=rate_limiter,
+        allow_local=allow_local,
+        confirm_s3_writes=confirm_s3_writes,
+    )
+
+    # --- Cloud resource enumeration (cloud_enum-style). Opt-in: generate
+    # candidate names from the target keyword(s) and probe AWS S3 / Azure Blob /
+    # GCP for existing/open storage, auto-handing AWS hits to the deep s3_bucket
+    # scanner. Keyword-driven, so it runs even with no HTTP endpoints. ---
+    if cloud_enum:
+        await _run_cloud_enum(
+            all_findings=all_findings,
+            scanned=scanned,
+            s3_scan_targets=s3_scan_targets,
+            root_domain=root_domain,
+            keywords=cloud_keywords or [],
+            wordlist_path=cloud_enum_wordlist,
+            max_candidates=cloud_enum_max,
+            rate_limiter=rate_limiter,
+            allow_local=allow_local,
+        )
+
+    if not endpoints:
+        if not all_findings:
+            console.print("[yellow][-][/yellow] No endpoints found, stopping here.")
+        return _finish(all_findings, output, show_leak, report_formats, feedback_store, ml_model)
+
+    # --- SSRF OOB canary: auto-start (default-on) so blind SSRF (level 4) runs
+    # without the user passing --blind. Gated on the same confirm_owned_infra
+    # that already gates the whole SSRF/IMDS module, so enabling the canary
+    # never makes the scan reach further than the SSRF scanner already does.
+    # Safety posture is preserved: the canary is a loopback-only listener and
+    # the only extra traffic is one read-only outbound fetch the target makes
+    # to it per SSRF-candidate parameter - no new destructive or noisy probes.
+    # A remote target cannot reach a 127.0.0.1 canary, so this yields real
+    # evidence only against local/owned infra; against a remote target it is a
+    # harmless no-op (no false blind finding). --blind forces it on even with
+    # --no-auto-canary; --no-auto-canary opts out of the automatic start. If
+    # the listener cannot bind, we fall back exactly to the pre-auto behavior
+    # (no canary, no blind escalation) instead of crashing.
+    canary = None
+    canary_error: Exception | None = None
+    canary_how = ""
+    if _want_canary(blind=blind, auto_canary=auto_canary, confirm_owned_infra=confirm_owned_infra):
+        canary, canary_error, canary_how = _build_oob_interaction(
+            oob_server=oob_server, oob_bind=oob_bind, oob_public_url=oob_public_url
+        )
+    if canary_error is not None:
+        console.print(
+            f"[yellow][!][/yellow] OOB interaction backend could not start "
+            f"({canary_error}); continuing without blind SSRF / jku / x5u OOB "
+            "confirmation."
+        )
+    if canary:
+        trigger = "forced by --blind" if blind else "auto-started"
+        console.print(f"[cyan][*][/cyan] OOB interaction {trigger}: {canary_how}")
+        # A loopback canary is only reachable by a local target; warn when the
+        # target is clearly remote so a silent no-op isn't mistaken for "clean".
+        if getattr(canary, "is_loopback", True) and not allow_local:
+            console.print(
+                "[yellow][!][/yellow] OOB backend is loopback-only; a remote "
+                "target cannot reach it. For remote OOB confirmation use "
+                "--oob-server <url> or --oob-bind/--oob-public-url."
+            )
+
+    try:
+        for ep_url in endpoints:
+            console.print(f"[cyan]  ->[/cyan] {ep_url}")
+
+            try:
+                authz_scanner = AuthzBypassScanner(
+                    scope_manager=scope,
+                    http_engine=http_engine,
+                    confirm_destructive=confirm_destructive,
+                )
+                all_findings += await run_scanner(
+                    authz_scanner,
+                    AuthzBypassTarget(
+                        url=ep_url,
+                        include_destructive_methods=confirm_destructive,
+                    ),
+                )
+                all_findings += await run_scanner(
+                    CorsMisconfigScanner(scope_manager=scope, http_engine=http_engine),
+                    CorsMisconfigTarget(url=ep_url),
+                )
+                scanned.add(("authz_bypass", ep_url))
+                scanned.add(("cors_misconfig", ep_url))
+            except ScannerConfirmationError as e:
+                console.print(f"[yellow]    [!][/yellow] Auth Bypass skipped: {e}")
+            except Exception as e:
+                console.print(f"[yellow]    [!][/yellow] Auth Bypass failed: {e}")
+
+            # --- Declarative YAML rules (opt-in via --rules). Runs the loaded
+            # http-endpoint rules through the same scope/safety-enforcing engine.
+            # Findings dedupe against the code scanners above when they overlap.
+            if yaml_rules:
+                try:
+                    rule_scanner = RuleScanner(
+                        rules=yaml_rules,
+                        scope_manager=scope,
+                        http_engine=http_engine,
+                        confirm_owned_infra=confirm_owned_infra,
+                    )
+                    all_findings += await run_scanner(
+                        rule_scanner, RuleScanTarget(url=ep_url)
+                    )
+                    scanned.add(("rule_scanner", ep_url))
+                except Exception as e:
+                    console.print(f"[yellow]    [!][/yellow] YAML rules failed: {e}")
+
+            try:
+                # Use the full Arjun-derived wordlist (no artificial 300-param
+                # cap) so uncommon URL/webhook/redirect parameter names that
+                # back real SSRF are not missed.
+                pconfig = ParameterDiscoveryConfig(url=ep_url, max_params=2000)
+                # discover_parameters is a synchronous, potentially slow
+                # call (up to max_params sequential HTTP requests). It is
+                # offloaded to a worker thread so it never blocks this
+                # coroutine's event loop while it runs.
+                discovery_result = await asyncio.to_thread(
+                    discover_parameters, pconfig, scope, http_engine
+                )
+                ssrf_params = select_ssrf_candidates(discovery_result)
+                if discovery_result.probe_errors:
+                    console.print(
+                        f"[yellow]    [!][/yellow] Parameter discovery: "
+                        f"{discovery_result.probe_errors}/{discovery_result.probes_sent} probes failed"
+                    )
+                for param_name in ssrf_params:
+                    console.print(f"[cyan]    [*][/cyan] SSRF candidate: {param_name}")
+                    ssrf_target = SsrfImdsTarget(
+                        url=ep_url, param_name=param_name, canary_server=canary
+                    )
+                    ssrf_scanner = SsrfImdsScanner(
+                        scope_manager=scope,
+                        http_engine=http_engine,
+                        confirm_owned_infra=confirm_owned_infra,
+                    )
+                    all_findings += await run_scanner(ssrf_scanner, ssrf_target)
+                    scanned.add(("ssrf_imds", ep_url))
+            except ScannerConfirmationError as e:
+                console.print(f"[yellow]    [!][/yellow] SSRF skipped: {e}")
+            except Exception as e:
+                console.print(f"[yellow]    [!][/yellow] Parameter discovery failed: {e}")
+
+            if token:
+                try:
+                    # canary_server wires the OOB backend so jku + x5u header
+                    # injection confirm via a real callback; check_weak_secret
+                    # is off here because the weak-HS256 check already ran once
+                    # centrally above (it is a token property, not per-endpoint).
+                    jwt_target = JwtTarget(
+                        url=ep_url,
+                        sample_token=token,
+                        canary_server=canary,
+                        check_weak_secret=False,
+                    )
+                    all_findings += await run_scanner(
+                        JwtTamperScanner(scope_manager=scope, http_engine=http_engine),
+                        jwt_target,
+                    )
+                    scanned.add(("jwt_tamper", ep_url))
+                except Exception as e:
+                    console.print(f"[yellow]    [!][/yellow] JWT check failed: {e}")
+    finally:
+        if canary:
+            canary.stop()
+
+    identities = _parse_identities(identities_raw)
+    if len(identities) >= 2:
+        console.print(f"[cyan][*][/cyan] BOLA: testing with {len(identities)} identities ...")
+        tester = BolaTester(identities=identities, min_confidence="LOW", scope_manager=scope)
+        bola_findings = await tester.run(report)
+        all_findings += [_bola_to_finding(bf) for bf in bola_findings]
+        console.print(f"[cyan][*][/cyan] BOLA: {len(bola_findings)} finding(s).")
+    elif identities_raw:
+        console.print(
+            "[yellow][!][/yellow] BOLA requires at least two --identity values "
+            "(one identity alone can't be compared) - skipped."
+        )
+
+    # --- Finding-driven follow-ups: run (or recommend) only the deeper tests
+    # the detection pass actually justified - see risk/triggers.py. The broad
+    # pass above already covered its own (scanner, asset) pairs, so follow-ups
+    # that duplicate it are skipped; the value grows as later phases add
+    # scanners (S3, API-keys) whose findings trigger new deep tests. ---
+    context = TriggerContext(
+        has_token=bool(token),
+        has_identities=len(identities) >= 2,
+        has_canary=False,  # the OOB canary is already stopped here; blind escalation is advised, not auto-run
+        has_iam_file=bool(iam_file),
+        confirm_s3_writes=confirm_s3_writes,
+    )
+    followups = derive_followups(all_findings, context)
+    pending = [fu for fu in followups if (fu.scanner, fu.asset) not in scanned]
+    if pending:
+        console.print(f"\n[cyan][*][/cyan] Finding-driven follow-ups: {len(pending)}")
+        for fu in pending:
+            if fu.scanner == "jwt_tamper" and token:
+                try:
+                    all_findings += await run_scanner(
+                        JwtTamperScanner(scope_manager=scope, http_engine=http_engine),
+                        JwtTarget(
+                            url=fu.asset, sample_token=token, check_weak_secret=False
+                        ),
+                    )
+                    scanned.add((fu.scanner, fu.asset))
+                    console.print(f"[cyan]    [>][/cyan] ran {fu.scanner} on {fu.asset} — {fu.reason}")
+                except Exception as e:
+                    console.print(f"[yellow]    [!][/yellow] follow-up {fu.scanner} failed: {e}")
+            elif fu.scanner == "s3_permcheck" and fu.asset in s3_scan_targets:
+                # Deeper S3 step: re-run the bucket with confirm_writes=True so
+                # the (read-only, ACL-derived) write/delete permission check is
+                # evaluated now that a public finding justified it.
+                try:
+                    engine, s3_target = s3_scan_targets[fu.asset]
+                    all_findings += await run_scanner(
+                        S3BucketScanner(
+                            scope_manager=scope,
+                            http_engine=engine,
+                            confirm_writes=True,
+                        ),
+                        s3_target,
+                    )
+                    scanned.add((fu.scanner, fu.asset))
+                    console.print(f"[cyan]    [>][/cyan] ran s3 permission-check on {fu.asset} — {fu.reason}")
+                except Exception as e:
+                    console.print(f"[yellow]    [!][/yellow] follow-up {fu.scanner} failed: {e}")
+            else:
+                # No standalone target available to auto-run this one here;
+                # surface it as a justified next step for the analyst.
+                console.print(f"[cyan]    [>][/cyan] recommend {fu.scanner} on {fu.asset} — {fu.reason}")
+
+    return _finish(all_findings, output, show_leak, report_formats, feedback_store, ml_model)
+
+
+_BARE_BUCKET_RE = re.compile(r"[a-z0-9][a-z0-9.\-]{1,61}[a-z0-9]")
+
+
+def _concrete_bucket(ref: str) -> str | None:
+    """Resolve a bucket reference (name / s3:// URI / S3 URL) to a concrete
+    bucket name, or None for a glob pattern or non-bucket string (a glob like
+    'target-*' is a scope filter, not something that can be probed)."""
+    name = extract_bucket_name(ref)
+    if name:
+        return name
+    r = (ref or "").strip().lower()
+    if "*" in r or "?" in r:
+        return None
+    return r if _BARE_BUCKET_RE.fullmatch(r) else None
+
+
+def _s3_object_key(ref: str) -> str | None:
+    """Best-effort object key from an s3:// URI or an S3 URL path."""
+    if not isinstance(ref, str):
+        return None
+    v = ref.strip()
+    if v.lower().startswith("s3://"):
+        rest = v[5:].split("?", 1)[0]
+        parts = rest.split("/", 1)
+        return parts[1] if len(parts) == 2 and parts[1] else None
+    if "amazonaws.com" in v.lower():
+        parsed = urlparse(v if "://" in v else "//" + v)
+        host = (parsed.hostname or "").lower()
+        path = parsed.path.lstrip("/")
+        if not path:
+            return None
+        first_label = host.split(".", 1)[0]
+        # Virtual-hosted host is "<bucket>.s3...": the whole path is the key.
+        # Path-style host is "s3...": the first path segment is the bucket, the
+        # remainder is the key.
+        if first_label and first_label != "s3" and not first_label.startswith("s3-"):
+            return path or None
+        parts = path.split("/", 1)
+        return parts[1] if len(parts) == 2 and parts[1] else None
+    return None
+
+
+def _build_s3_engine(
+    bucket: str, region: str | None, allow_local: bool, rate_limiter
+) -> HttpEngine | None:
+    """An HttpEngine scoped to the bucket's S3 host. S3 endpoints are public,
+    so the engine's own scope guard permits them while still refusing any
+    non-S3 host; returns None if the host is not a usable scope target."""
+    host = s3_host_for(bucket, region)
+    try:
+        s3_scope = ScopeManager(host, allow_local_targets=allow_local)
+    except ScopeError:
+        return None
+    return HttpEngine(scope_manager=s3_scope, rate_limiter=rate_limiter)
+
+
+def _cname_resolver(host: str) -> str | None:
+    """Best-effort CNAME lookup via the stdlib (no extra dependency). The alias
+    list from ``gethostbyname_ex`` carries the CNAME chain; the last alias is
+    the closest-to-target canonical name. Returns None on any failure."""
+    import socket
+
+    try:
+        _name, aliases, _ips = socket.gethostbyname_ex(host)
+    except Exception:
+        return None
+    return aliases[-1] if aliases else None
+
+
+async def _run_cloud_scanners(
+    *,
+    all_findings: list,
+    scanned: set,
+    s3_scan_targets: dict,
+    endpoints: list[str],
+    imported: ImportedTraffic | None,
+    buckets: tuple[str, ...],
+    root_domain: str,
+    scope: ScopeManager,
+    http_engine: HttpEngine,
+    rate_limiter,
+    allow_local: bool,
+    confirm_s3_writes: bool,
+) -> None:
+    """Run the Phase 3 cloud scanners and fold their findings into the run.
+
+    Each scanner is isolated in its own try/except so a failure in one (or a
+    single bad target) never aborts the scan.
+    """
+    # ---- S3 bucket misconfiguration ------------------------------------
+    # Candidate references: explicit bucket scope + imported s3 links + any S3
+    # URLs discovered among endpoints. Deduplicated by concrete bucket name.
+    s3_refs: list[str] = list(buckets)
+    if imported and imported.s3_links:
+        s3_refs += imported.s3_links
+    s3_refs += [ep for ep in endpoints if extract_bucket_name(ep)]
+
+    seen_buckets: set[str] = set()
+    for ref in s3_refs:
+        bucket = _concrete_bucket(ref)
+        if not bucket or bucket in seen_buckets:
+            continue
+        seen_buckets.add(bucket)
+        # Respect bucket scope when configured.
+        if scope.has_bucket_scope and not scope.is_bucket_in_scope(ref):
+            console.print(f"[yellow]    [!][/yellow] S3 bucket out of scope, skipped: {bucket}")
+            continue
+        engine = _build_s3_engine(bucket, None, allow_local, rate_limiter)
+        if engine is None:
+            continue
+        target = S3BucketTarget(bucket=bucket, sample_object_key=_s3_object_key(ref))
+        try:
+            found = await run_scanner(
+                S3BucketScanner(
+                    scope_manager=scope, http_engine=engine, confirm_writes=False
+                ),
+                target,
+            )
+            all_findings += found
+            scanned.add(("s3_bucket", f"s3://{bucket}"))
+            # Stash for a possible write-permission follow-up (keyed by the
+            # finding asset, which is "s3://<bucket>").
+            s3_scan_targets[f"s3://{bucket}"] = (engine, target)
+            if found:
+                console.print(f"[cyan]    [*][/cyan] S3 {bucket}: {len(found)} finding(s).")
+        except Exception as e:
+            console.print(f"[yellow]    [!][/yellow] S3 scan failed for {bucket}: {e}")
+
+    # ---- Secrets / API-key exposure ------------------------------------
+    secret_sources: list[SecretSource] = []
+    # Observed auth tokens from an imported capture are themselves exposed
+    # credentials; wrap each so the detector sees an Authorization context.
+    for tok in (imported.tokens if imported else []):
+        secret_sources.append(
+            SecretSource(
+                label="imported-traffic-token",
+                content=f"Authorization: Bearer {tok}",
+                location="imported-traffic",
+            )
+        )
+    # Discovered JS bundles are the prime place hardcoded keys leak; fetch the
+    # in-scope ones and scan their bodies.
+    js_urls = [
+        ep for ep in endpoints
+        if urlparse(ep).path.lower().endswith(".js") and scope.is_in_scope(ep)
+    ]
+    if secret_sources or js_urls:
+        try:
+            found = await run_scanner(
+                SecretScanScanner(scope_manager=scope, http_engine=http_engine),
+                SecretScanTarget(sources=secret_sources, fetch_urls=js_urls),
+            )
+            all_findings += found
+            scanned.add(("secret_scan", root_domain))
+            if found:
+                console.print(
+                    f"[cyan]    [*][/cyan] Secret scan: {len(found)} exposed secret(s) "
+                    f"across {len(secret_sources)} source(s) + {len(js_urls)} JS file(s)."
+                )
+        except Exception as e:
+            console.print(f"[yellow]    [!][/yellow] Secret scan failed: {e}")
+
+    # ---- Subdomain / resource takeover ---------------------------------
+    hosts: list[str] = []
+    seen_hosts: set[str] = set()
+    for candidate in [root_domain] + [urlparse(ep).hostname or "" for ep in endpoints]:
+        h = (candidate or "").strip().lower()
+        if not h or h in seen_hosts or not scope.is_in_scope(h):
+            continue
+        seen_hosts.add(h)
+        hosts.append(h)
+    for host in hosts:
+        try:
+            found = await run_scanner(
+                TakeoverScanner(
+                    scope_manager=scope,
+                    http_engine=http_engine,
+                    resolver=_cname_resolver,
+                ),
+                TakeoverTarget(host=host),
+            )
+            all_findings += found
+            scanned.add(("takeover", host))
+            if found:
+                console.print(f"[cyan]    [*][/cyan] Takeover indicator on {host}: {len(found)}.")
+        except Exception as e:
+            console.print(f"[yellow]    [!][/yellow] Takeover scan failed for {host}: {e}")
+
+
+def _provider_engine_factory(allow_local: bool, rate_limiter):
+    """Return ``factory(host) -> HttpEngine`` that builds (and caches) one
+    scope-to-that-host engine per provider host. Each engine's own ScopeManager
+    permits only its single public cloud host; a host that is not a valid scope
+    target yields None (the scanner then skips that provider)."""
+    cache: dict[str, HttpEngine | None] = {}
+
+    def factory(host: str):
+        if host in cache:
+            return cache[host]
+        try:
+            eng = HttpEngine(
+                scope_manager=ScopeManager(host, allow_local_targets=allow_local),
+                rate_limiter=rate_limiter,
+            )
+        except ScopeError:
+            eng = None
+        cache[host] = eng
+        return eng
+
+    return factory
+
+
+async def _run_cloud_enum(
+    *,
+    all_findings: list,
+    scanned: set,
+    s3_scan_targets: dict,
+    root_domain: str,
+    keywords: list[str],
+    wordlist_path: str | None,
+    max_candidates: int,
+    rate_limiter,
+    allow_local: bool,
+) -> None:
+    """Generate candidate names from keyword(s) and probe AWS/Azure/GCP storage.
+
+    AWS hits are handed to the deep ``s3_bucket`` scanner (the "auto -> S3
+    scanner" flow); Azure and GCP hits are reported directly. All probes are
+    read-only GETs through per-host, scope-enforcing engines.
+    """
+    kws = [k for k in keywords if k.strip()]
+    derived = keyword_from_domain(root_domain)
+    if derived and derived not in kws:
+        kws.append(derived)
+    if not kws:
+        console.print("[yellow][!][/yellow] Cloud enum: no usable keyword, skipped.")
+        return
+
+    mutations = None
+    if wordlist_path:
+        try:
+            mutations = load_mutations(wordlist_path)
+        except OSError as e:
+            console.print(f"[yellow][!][/yellow] Cloud enum wordlist ignored: {e}")
+
+    candidates = generate_candidates(kws, mutations, max_candidates=max_candidates)
+    console.print(
+        f"[cyan][*][/cyan] Cloud enum: {len(candidates)} candidate name(s) from "
+        f"keyword(s) {', '.join(kws)} (AWS/Azure/GCP)."
+    )
+
+    factory = _provider_engine_factory(allow_local, rate_limiter)
+    enum_scanner = CloudStorageScanner(engine_factory=factory)
+    aws_hits: set[str] = set()
+
+    for name in candidates:
+        target = CloudStorageTarget(name=name, azure_account=azure_account_name(name))
+        try:
+            found = await run_scanner(enum_scanner, target)
+        except Exception as e:
+            console.print(f"[yellow]    [!][/yellow] Cloud enum failed for {name}: {e}")
+            continue
+        if not found:
+            continue
+        all_findings += found
+        scanned.add(("cloud_storage_enum", name))
+        for f in found:
+            if f.evidence.get("provider") == "aws":
+                aws_hits.add(f.evidence.get("bucket") or name)
+            console.print(
+                f"[cyan]    [*][/cyan] {f.category}: {f.asset}"
+            )
+
+    # Auto hand-off: run the deep S3 scanner on every existing AWS bucket found.
+    for bucket in sorted(aws_hits):
+        asset = f"s3://{bucket}"
+        if ("s3_bucket", asset) in scanned:
+            continue
+        engine = _build_s3_engine(bucket, None, allow_local, rate_limiter)
+        if engine is None:
+            continue
+        s3_target = S3BucketTarget(bucket=bucket)
+        try:
+            deep = await run_scanner(
+                S3BucketScanner(http_engine=engine, confirm_writes=False), s3_target
+            )
+            all_findings += deep
+            scanned.add(("s3_bucket", asset))
+            s3_scan_targets[asset] = (engine, s3_target)
+            if deep:
+                console.print(
+                    f"[cyan]    [>][/cyan] s3_bucket deep scan on {bucket}: {len(deep)} finding(s)."
+                )
+        except Exception as e:
+            console.print(f"[yellow]    [!][/yellow] s3_bucket deep scan failed for {bucket}: {e}")
+
+
+_BOLA_CONFIDENCE_TO_FLOAT = {"HIGH": 0.9, "MEDIUM": 0.6, "LOW": 0.4}
+_BOLA_CONFIDENCE_TO_SEVERITY = {"HIGH": "critical", "MEDIUM": "high", "LOW": "medium"}
+
+
+def _bola_to_finding(bf) -> Finding:
+    """BolaFinding has a different schema from the shared Finding type
+    (confidence is a string like HIGH/MEDIUM/LOW, no separate severity) -
+    converted here so the unified report stays consistent with every
+    other module."""
+    return Finding(
+        asset=bf.endpoint,
+        category="bola-cross-tenant-access",
+        severity=_BOLA_CONFIDENCE_TO_SEVERITY.get(bf.confidence, "medium"),
+        confidence=_BOLA_CONFIDENCE_TO_FLOAT.get(bf.confidence, 0.5),
+        evidence={
+            "owner_identity": bf.owner_identity,
+            "tester_identity": bf.tester_identity,
+            "json_similarity": bf.json_similarity,
+            "grounding": bf.grounding,
+            "notes": bf.notes,
+        },
+        discovery_source="scanner",
+        remediation=(
+            "Actually verify resource ownership before returning data "
+            "(match the identity extracted from the session against the "
+            "resource's owner), not just that the JWT/session is valid."
+        ),
+    )
+
+
+def _parse_identities(raw: list[str]) -> list[Identity]:
+    """Each --identity is name=HeaderValue (e.g. tenant_a='Bearer xyz')."""
+    identities = []
+    for item in raw:
+        if "=" not in item:
+            continue
+        name, _, header_value = item.partition("=")
+        identities.append(Identity(name=name, headers={"Authorization": header_value}))
+    return identities
+
+
+_VALID_FORMATS = ("json", "html", "sarif")
+
+# Each writer takes (findings, path, redact=..., preserve_order=...) and the
+# extension its output path should carry.
+_FORMAT_WRITERS = {
+    "json": (export_json, ".json"),
+    "html": (export_html, ".html"),
+    "sarif": (export_sarif, ".sarif"),
+}
+
+
+def parse_report_formats(raw: list[str] | None) -> list[str]:
+    """Normalize --format values (repeatable and/or comma-separated) into an
+    ordered, de-duplicated list of known formats. Unknown tokens are dropped
+    with a warning; JSON is always included so the default report never
+    vanishes."""
+    formats: list[str] = []
+    for item in raw or []:
+        for token in str(item).split(","):
+            name = token.strip().lower()
+            if not name:
+                continue
+            if name not in _VALID_FORMATS:
+                console.print(f"[yellow][!][/yellow] Unknown --format '{name}', ignored.")
+                continue
+            if name not in formats:
+                formats.append(name)
+    if "json" not in formats:
+        formats.insert(0, "json")
+    return formats
+
+
+def _report_path(output: Path, fmt: str) -> Path:
+    """Where format ``fmt`` is written relative to the user's -o path.
+
+    The requested path keeps its exact name for the format that matches its
+    suffix (so JSON stays at ``wily-report.json``); other formats are written
+    as siblings with the format's own extension.
+    """
+    _writer, ext = _FORMAT_WRITERS[fmt]
+    if output.suffix.lower() == ext:
+        return output
+    # Strip a known report extension before appending the new one, so
+    # "wily-report.json" + html -> "wily-report.html", not ".json.html".
+    stem = output
+    if output.suffix.lower() in (".json", ".html", ".sarif"):
+        stem = output.with_suffix("")
+    return stem.with_name(stem.name + ext)
+
+
+def _write_reports(
+    findings: list, output: str, show_leak: bool, report_formats: list[str] | None
+) -> None:
+    formats = parse_report_formats(report_formats)
+    base = Path(output)
+    for fmt in formats:
+        writer, _ext = _FORMAT_WRITERS[fmt]
+        path = _report_path(base, fmt)
+        writer(findings, path, redact=not show_leak, preserve_order=True)
+        console.print(f"[green][+][/green] {fmt.upper()} report: {path.resolve()}")
+
+
+def _finish(
+    findings: list,
+    output: str,
+    show_leak: bool = False,
+    report_formats: list[str] | None = None,
+    feedback_store: str | None = None,
+    ml_model: str | None = None,
+) -> list:
+    # Correlation/dedup pass before anything is displayed or written, so the
+    # console summary and the report agree and neither shows the same issue
+    # twice. In order:
+    #   1. exact-duplicate collapse (deterministic rules),
+    #   2. near-duplicate clustering on the SAME asset (risk/ml/dedup.deduplicate),
+    #   3. endpoint-hash clustering across DIFFERENT assets that normalize to
+    #      the same shape (risk/ml/dedup.cluster_by_endpoint_hash),
+    #   4. annotate with any prior analyst --valid/--fp decision, if a
+    #      feedback store was given (risk/ml/feedback - opt-in, informational
+    #      only: it never drops or reorders a finding), then
+    #   5. ranking/prioritisation (risk/ml/ranker) - the single source of the
+    #      order the table and the JSON report both use.
+    findings = apply_deterministic_rules(findings)
+    findings = deduplicate(findings)
+    findings = cluster_by_endpoint_hash(findings)
+    if feedback_store:
+        findings = FeedbackStore(feedback_store).apply(findings)
+
+    # Optional trained-model re-ranking (opt-in via --ml-model). When no model
+    # is given, rank_findings runs heuristic-only, exactly as before. A model
+    # that fails to load degrades to heuristics with a warning - it never
+    # aborts the scan - and the model can only re-rank/annotate, never drop a
+    # finding.
+    triage_model = None
+    if ml_model:
+        triage_model, reason = load_triage_model(ml_model)
+        if triage_model is None:
+            console.print(
+                f"[yellow][!][/yellow] --ml-model ignored ({reason}); "
+                "falling back to heuristic ranking."
+            )
+        else:
+            console.print(
+                f"[cyan][*][/cyan] ML triage model enabled ({ml_model}); "
+                "findings re-ranked + annotated with evidence['ml_valid_probability']."
+            )
+    findings = rank_findings(findings, model=triage_model)
+
+    console.print(f"\n[green][+][/green] Total findings: {len(findings)}\n")
+    if findings:
+        table = Table(title="All findings (highest risk first)")
+        table.add_column("Risk", justify="right")
+        table.add_column("Category", style="red")
+        table.add_column("Asset", overflow="fold")
+        table.add_column("Severity")
+        for f in findings:
+            risk = compute_risk_score(f.severity, f.confidence)
+            table.add_row(f"{risk:.1f}", f.category, str(f.asset), f.severity)
+        console.print(table)
+
+    if show_leak:
+        console.print(
+            "[yellow][!][/yellow] --show-leak: evidence written UNREDACTED "
+            "(captured secrets are visible in the report)."
+        )
+    _write_reports(findings, output, show_leak, report_formats)
+    return findings

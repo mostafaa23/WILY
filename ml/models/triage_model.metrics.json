@@ -1,0 +1,51 @@
+{
+  "n_samples": 18,
+  "n_valid": 9,
+  "n_false_positive": 9,
+  "feature_names": [
+    "severity_rank",
+    "confidence",
+    "risk_score",
+    "heuristic_priority",
+    "sensitivity_adjustment",
+    "bola_grounding",
+    "is_live_cloud_credential",
+    "soft_404_similarity",
+    "has_soft_404_similarity",
+    "authenticated_similarity",
+    "has_authenticated_similarity",
+    "duplicate_count",
+    "merged_endpoint_count",
+    "category__authz-bypass",
+    "category__bola",
+    "category__secret-exposure",
+    "category__cloud-ssrf",
+    "category__iam-privesc",
+    "category__s3-bucket",
+    "category__takeover",
+    "category__jwt",
+    "category__session",
+    "category__cors",
+    "category__other"
+  ],
+  "model": {
+    "precision": 1.0,
+    "recall": 1.0,
+    "f1": 1.0,
+    "n_test": 6,
+    "n_valid_test": 3
+  },
+  "heuristic_baseline": {
+    "precision": 0.5,
+    "recall": 1.0,
+    "f1": 0.6666666666666666,
+    "n_test": 6,
+    "n_valid_test": 3
+  },
+  "heuristic_threshold": 0.6153846153846154,
+  "cv_f1_mean": 0.8,
+  "cv_f1_std": 0.4,
+  "cv_recall_mean": 0.8,
+  "trained_at": "2026-11-23T11:18:53.364888+00:00",
+  "recall_regressed": false
+}
