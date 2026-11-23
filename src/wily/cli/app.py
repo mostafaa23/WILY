@@ -314,6 +314,14 @@ def scan_command(
             "looks like a gate hit. Default 'none' (never fails the build)."
         ),
     ),
+    verbose: bool = typer.Option(
+        False, "--verbose", "-v",
+        help=(
+            "Stream the full per-request log live in the terminal. By default a "
+            "multi-target scan shows a clean progress bar and writes the verbose "
+            "log to <domain>/scan.log instead."
+        ),
+    ),
 ) -> None:
     """The full bundle, automatically (Discovery + Auth Bypass + CORS + SSRF)
     against one or more domains, enabling JWT/BOLA/IAM based on the inputs you
@@ -376,6 +384,7 @@ def scan_command(
                 oob_bind=oob_bind,
                 oob_public_url=oob_public_url,
                 ml_model=ml_model,
+                verbose=verbose,
             )
         )
     except Exception as e:

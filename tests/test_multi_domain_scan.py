@@ -143,7 +143,7 @@ def test_multiple_targets_write_separate_reports(fake_scan, tmp_path):
     assert [c["domain"] for c in fake_scan] == ["a.com", "b.com", "c.com"]
     # One separate report file per domain, named after the sanitized domain.
     for name in ("a.com", "b.com", "c.com"):
-        report = out_dir / f"{name}.json"
+        report = out_dir / name / "report.json"
         assert report.exists(), f"missing report for {name}"
         assert json.loads(report.read_text(encoding="utf-8"))["domain"] == name
     # The reports are genuinely distinct files (no single merged report).
@@ -162,7 +162,7 @@ def test_output_dir_created_if_missing(fake_scan, tmp_path):
         )
     )
     assert out_dir.is_dir()
-    assert (out_dir / "a.com.json").exists()
+    assert (out_dir / "a.com" / "report.json").exists()
 
 
 def test_colliding_sanitized_names_get_unique_files(fake_scan, tmp_path):
@@ -178,8 +178,8 @@ def test_colliding_sanitized_names_get_unique_files(fake_scan, tmp_path):
     assert len(fake_scan) == 2
     outputs = {c["output"] for c in fake_scan}
     assert len(outputs) == 2  # no overwrite
-    assert (out_dir / "a.com.json").exists()
-    assert (out_dir / "a.com-2.json").exists()
+    assert (out_dir / "a.com" / "report.json").exists()
+    assert (out_dir / "a.com-2" / "report.json").exists()
 
 
 def test_single_target_with_output_dir_uses_dir(fake_scan, tmp_path):
@@ -192,7 +192,7 @@ def test_single_target_with_output_dir_uses_dir(fake_scan, tmp_path):
         )
     )
     assert len(fake_scan) == 1
-    assert fake_scan[0]["output"] == str(out_dir / "example.com.json")
+    assert fake_scan[0]["output"] == str(out_dir / "example.com" / "report.json")
 
 
 def test_scan_kwargs_forwarded_per_domain(fake_scan, tmp_path):

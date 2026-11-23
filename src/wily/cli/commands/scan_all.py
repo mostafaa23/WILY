@@ -13,11 +13,15 @@ must only target infrastructure the tester owns.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import json
+import logging
 import re
 from pathlib import Path
 from urllib.parse import urlparse
 
 from rich.console import Console
+from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 from rich.table import Table
 
 from wily.core.oob_canary import OOBCanaryServer
@@ -88,6 +92,103 @@ from wily.scanners.takeover import TakeoverScanner, TakeoverTarget
 from wily.templates.loader import load_rules
 
 console = Console(stderr=True)
+
+_SEVERITY_RANK = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
+
+
+@contextlib.contextmanager
+def _domain_output(log_path: Path, *, verbose: bool):
+    """Route every ``wily.*`` log record for one domain's scan into
+    ``log_path`` (so the terminal is not flooded with per-request noise such as
+    'Scope guard: refusing redirect ...'), and - unless ``verbose`` - silence
+    the chatty ``console`` prints so only the progress bar and final summary
+    show. Everything is restored on exit."""
+    wily_logger = logging.getLogger("wily")
+    handler = logging.FileHandler(log_path, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    prev_level = wily_logger.level
+    prev_quiet = console.quiet
+    wily_logger.setLevel(logging.INFO)
+    wily_logger.addHandler(handler)
+    if not verbose:
+        console.quiet = True
+    try:
+        yield
+    finally:
+        console.quiet = prev_quiet
+        wily_logger.removeHandler(handler)
+        handler.close()
+        wily_logger.setLevel(prev_level)
+
+
+def _dump_collected(artifacts_dir: Path, report, findings: list) -> None:
+    """Persist the raw data a scan gathered - the discovered endpoints/URLs, any
+    cloud-storage hits, and a counts summary - under ``<domain>/collected/`` so
+    it can be revisited later, separate from the final findings report."""
+    coll = Path(artifacts_dir) / "collected"
+    coll.mkdir(parents=True, exist_ok=True)
+
+    try:
+        disc = report.to_json() if report is not None else {}
+    except Exception:
+        disc = {}
+    endpoints = disc.get("endpoints", []) if isinstance(disc, dict) else []
+
+    (coll / "discovery.json").write_text(
+        json.dumps(disc, indent=2, default=str), encoding="utf-8"
+    )
+    (coll / "endpoints.txt").write_text(
+        "\n".join(str(e) for e in endpoints) + ("\n" if endpoints else ""),
+        encoding="utf-8",
+    )
+
+    s3_like = [
+        {"asset": str(f.asset), "category": f.category, "severity": f.severity}
+        for f in findings
+        if any(k in f.category.lower() for k in ("s3", "bucket", "cloud", "storage", "takeover"))
+    ]
+    (coll / "s3.json").write_text(json.dumps(s3_like, indent=2), encoding="utf-8")
+
+    by_sev: dict[str, int] = {}
+    by_cat: dict[str, int] = {}
+    for f in findings:
+        by_sev[f.severity] = by_sev.get(f.severity, 0) + 1
+        by_cat[f.category] = by_cat.get(f.category, 0) + 1
+    (coll / "summary.json").write_text(
+        json.dumps(
+            {
+                "endpoints_discovered": len(endpoints),
+                "findings": len(findings),
+                "by_severity": by_sev,
+                "by_category": by_cat,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
+def _print_scan_summary(status: Console, rows: list[tuple], out_dir: Path) -> None:
+    """One summary table across all domains, printed after the progress bar."""
+    table = Table(title="Scan summary")
+    table.add_column("#", justify="right")
+    table.add_column("Domain", overflow="fold")
+    table.add_column("Findings", justify="right")
+    table.add_column("Top severity")
+    for i, (domain, findings, _ddir) in enumerate(rows, start=1):
+        top = max(
+            (f.severity for f in findings),
+            key=lambda s: _SEVERITY_RANK.get((s or "").lower(), 0),
+            default="-",
+        )
+        table.add_row(str(i), domain, str(len(findings)), top)
+    status.print(table)
+    total = sum(len(f) for _d, f, _p in rows)
+    with_findings = sum(1 for _d, f, _p in rows if f)
+    status.print(
+        f"[green][+][/green] Done. {len(rows)} scanned, {with_findings} with "
+        f"findings, {total} total. Reports in [bold]{out_dir.resolve()}[/bold]."
+    )
 
 
 def _want_canary(*, blind: bool, auto_canary: bool, confirm_owned_infra: bool) -> bool:
@@ -226,6 +327,7 @@ async def run_scans(
     targets: list[str],
     output: str,
     output_dir: str | None = None,
+    verbose: bool = False,
     **scan_kwargs,
 ) -> dict[str, list]:
     """CLI-facing orchestrator: scan one or more domains, one report per domain.
@@ -255,18 +357,24 @@ async def run_scans(
         findings = await run_full_scan(domain=targets[0], output=output, **scan_kwargs)
         return {targets[0]: findings or []}
 
-    # Multi-domain (or single-domain-into-a-dir): one report file per domain.
+    # Multi-domain (or single-domain-into-a-dir): one FOLDER per domain, holding
+    # that domain's report(s), a scan.log, and a collected/ data dump.
     out_dir = Path(output_dir) if output_dir else Path(output).resolve().parent
     out_dir.mkdir(parents=True, exist_ok=True)
-    console.print(
-        f"[cyan][*][/cyan] Scanning {len(targets)} target(s) sequentially; "
-        f"one report per domain in [bold]{out_dir.resolve()}[/bold]."
+    # A separate, always-on console for the progress bar and the final summary,
+    # so they still show even while the chatty per-scan `console` is silenced.
+    status = Console(stderr=True)
+    status.print(
+        f"[cyan][*][/cyan] Scanning {len(targets)} target(s) -> "
+        f"[bold]{out_dir.resolve()}[/bold] (a folder per domain)."
     )
 
     results: dict[str, list] = {}
+    summary_rows: list[tuple] = []
     used_names: set[str] = set()
-    for index, domain in enumerate(targets, start=1):
-        # Resolve a unique per-domain base name (guard against two inputs that
+
+    async def _scan_one(index: int, domain: str) -> None:
+        # Resolve a unique per-domain folder name (guard against two inputs that
         # sanitize to the same stem, e.g. "a.com" and "https://a.com/").
         stem = sanitize_domain_filename(domain)
         candidate = stem
@@ -276,19 +384,44 @@ async def run_scans(
             suffix += 1
         used_names.add(candidate)
 
-        per_domain_output = out_dir / f"{candidate}.json"
-        console.print(
-            f"\n[bold cyan]=== [{index}/{len(targets)}] {domain} ===[/bold cyan]"
-        )
-        findings = await run_full_scan(
-            domain=domain, output=str(per_domain_output), **scan_kwargs
-        )
+        domain_dir = out_dir / candidate
+        domain_dir.mkdir(parents=True, exist_ok=True)
+        per_domain_output = domain_dir / "report.json"
+        with _domain_output(domain_dir / "scan.log", verbose=verbose):
+            findings = await run_full_scan(
+                domain=domain,
+                output=str(per_domain_output),
+                artifacts_dir=domain_dir,
+                **scan_kwargs,
+            )
         results[domain] = findings or []
-        console.print(
-            f"[green][+][/green] {domain}: report written under "
-            f"[bold]{per_domain_output.resolve()}[/bold]."
-        )
+        summary_rows.append((domain, findings or [], domain_dir))
 
+    if verbose:
+        # Live, chatty per-domain output (the old behaviour), into the folders.
+        for index, domain in enumerate(targets, start=1):
+            status.print(
+                f"\n[bold cyan]=== [{index}/{len(targets)}] {domain} ===[/bold cyan]"
+            )
+            await _scan_one(index, domain)
+    else:
+        # Clean terminal: just a progress bar; every verbose line goes to the
+        # per-domain scan.log instead.
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("{task.completed}/{task.total}"),
+            TimeElapsedColumn(),
+            console=status,
+        ) as progress:
+            task = progress.add_task("Starting...", total=len(targets))
+            for index, domain in enumerate(targets, start=1):
+                progress.update(task, description=f"[{index}/{len(targets)}] {domain}")
+                await _scan_one(index, domain)
+                progress.advance(task)
+
+    _print_scan_summary(status, summary_rows, out_dir)
     return results
 
 
@@ -324,6 +457,7 @@ async def run_full_scan(
     oob_bind: str | None = None,
     oob_public_url: str | None = None,
     ml_model: str | None = None,
+    artifacts_dir: str | Path | None = None,
 ) -> list:
     all_findings: list = []
 
@@ -612,7 +746,10 @@ async def run_full_scan(
     if not endpoints:
         if not all_findings:
             console.print("[yellow][-][/yellow] No endpoints found, stopping here.")
-        return _finish(all_findings, output, show_leak, report_formats, feedback_store, ml_model)
+        _result = _finish(all_findings, output, show_leak, report_formats, feedback_store, ml_model)
+        if artifacts_dir:
+            _dump_collected(Path(artifacts_dir), report, _result)
+        return _result
 
     # --- SSRF OOB canary: auto-start (default-on) so blind SSRF (level 4) runs
     # without the user passing --blind. Gated on the same confirm_owned_infra
@@ -821,7 +958,10 @@ async def run_full_scan(
                 # surface it as a justified next step for the analyst.
                 console.print(f"[cyan]    [>][/cyan] recommend {fu.scanner} on {fu.asset} — {fu.reason}")
 
-    return _finish(all_findings, output, show_leak, report_formats, feedback_store, ml_model)
+    _result = _finish(all_findings, output, show_leak, report_formats, feedback_store, ml_model)
+    if artifacts_dir:
+        _dump_collected(Path(artifacts_dir), report, _result)
+    return _result
 
 
 _BARE_BUCKET_RE = re.compile(r"[a-z0-9][a-z0-9.\-]{1,61}[a-z0-9]")
