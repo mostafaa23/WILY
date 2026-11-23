@@ -1313,11 +1313,18 @@ async def _run_cloud_scanners(
             console.print(f"[yellow]    [!][/yellow] Takeover scan failed for {host}: {e}")
 
 
-def _provider_engine_factory(allow_local: bool, rate_limiter):
+def _provider_engine_factory(allow_local: bool, rate_limiter, timeout: float = 10.0):
     """Return ``factory(host) -> HttpEngine`` that builds (and caches) one
     scope-to-that-host engine per provider host. Each engine's own ScopeManager
     permits only its single public cloud host; a host that is not a valid scope
-    target yields None (the scanner then skips that provider)."""
+    target yields None (the scanner then skips that provider).
+
+    ``timeout`` is overridable (default matches ``HttpEngine``'s own default):
+    cloud-enum candidates are overwhelmingly nonexistent names, where the cost
+    is a slow DNS/connect failure rather than a slow response from a real
+    endpoint - a shorter timeout there cuts worst-case latency without losing
+    true positives, which reply almost immediately.
+    """
     cache: dict[str, HttpEngine | None] = {}
 
     def factory(host: str):
@@ -1327,6 +1334,7 @@ def _provider_engine_factory(allow_local: bool, rate_limiter):
             eng = HttpEngine(
                 scope_manager=ScopeManager(host, allow_local_targets=allow_local),
                 rate_limiter=rate_limiter,
+                timeout=timeout,
             )
         except ScopeError:
             eng = None
@@ -1385,19 +1393,32 @@ async def _run_cloud_enum(
             "generated names - raise --cloud-enum-max to probe the rest."
         )
 
-    factory = _provider_engine_factory(allow_local, rate_limiter)
+    # A short per-request timeout: a real bucket/account replies almost
+    # instantly, so the only thing a long timeout buys here is a slower
+    # failure for the (overwhelming majority of) names that don't exist.
+    factory = _provider_engine_factory(allow_local, rate_limiter, timeout=5.0)
     enum_scanner = CloudStorageScanner(engine_factory=factory)
     aws_hits: set[str] = set()
 
-    for name in candidates:
-        target = CloudStorageTarget(name=name, azure_account=azure_account_name(name))
-        try:
-            found = await run_scanner(enum_scanner, target)
-        except Exception as e:
-            console.print(f"[yellow]    [!][/yellow] Cloud enum failed for {name}: {e}")
-            continue
+    # Bounded concurrency, higher than the discovery pipeline's default (15):
+    # candidates are independent per-host probes across three separate cloud
+    # providers, not many requests against one target, so there is no shared
+    # host to overload by running more of them at once. Running them
+    # one-at-a-time previously serialized the ENTIRE cap (up to 400+ names x a
+    # ~10s timeout each - tens of minutes) for no safety reason.
+    _sem = asyncio.Semaphore(40)
+
+    async def _probe_one(name: str) -> None:
+        nonlocal all_findings
+        async with _sem:
+            target = CloudStorageTarget(name=name, azure_account=azure_account_name(name))
+            try:
+                found = await run_scanner(enum_scanner, target)
+            except Exception as e:
+                console.print(f"[yellow]    [!][/yellow] Cloud enum failed for {name}: {e}")
+                return
         if not found:
-            continue
+            return
         all_findings += found
         scanned.add(("cloud_storage_enum", name))
         for f in found:
@@ -1406,6 +1427,8 @@ async def _run_cloud_enum(
             console.print(
                 f"[cyan]    [*][/cyan] {f.category}: {f.asset}"
             )
+
+    await asyncio.gather(*(_probe_one(name) for name in candidates))
 
     # Auto hand-off: run the deep S3 scanner on every existing AWS bucket found.
     for bucket in sorted(aws_hits):
