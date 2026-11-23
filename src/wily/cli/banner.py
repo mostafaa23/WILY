@@ -36,9 +36,5 @@ def print_banner(quiet: bool = False) -> None:
         )
 
     _console_err.print(f"[bold cyan]{_ASCII_LOGO}[/bold cyan]")
-    _mark(f"Wily - {TAGLINE}")
     _mark(f"Version {__version__}")
-    _mark(f"[dim]{HOMEPAGE}[/dim]")
-    _console_err.print(
-        "[yellow]Use responsibly: scan only targets you are authorized to test.[/yellow]\n"
-    )
+    _mark(f"[dim]{HOMEPAGE}[/dim]\n")
