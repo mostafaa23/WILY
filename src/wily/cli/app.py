@@ -412,10 +412,12 @@ def main_callback(
 ) -> None:
     # Print the banner on every invocation (like nuclei), unless --quiet.
     print_banner(quiet=quiet)
-    # Bare ``wily`` with no sub-command: show the banner, then the help, and
-    # exit cleanly - instead of a "Missing command" error.
+    # Bare ``wily`` with no sub-command: show only the banner (plus a short
+    # hint), and exit cleanly. The full command/option listing is reserved for
+    # ``wily -h`` / ``wily --help``.
     if ctx.invoked_subcommand is None:
-        typer.echo(ctx.get_help())
+        if not quiet:
+            typer.echo("Run 'wily -h' to see the available commands.", err=True)
         raise typer.Exit()
 
 
