@@ -186,21 +186,23 @@ def test_lab_write_skipped_when_flag_off(monkeypatch):
     assert not any(f.category == "s3-bucket-public-writable" for f in findings)
 
 
-def test_lab_write_skipped_when_scope_not_owned(monkeypatch):
+def test_lab_write_fires_even_when_scope_not_owned(monkeypatch):
+    """The active write probe only has two gates now (env var + --s3-lab-write):
+    no bucket-scope check. A knowingly removed safety check - the probe fires
+    on ANY bucket the scanner reaches once both flags are set, not only one
+    declared owned/lab via --scope-bucket."""
     monkeypatch.setenv(_ENV_VAR, "true")
-    http = _WriteFakeHttp()
-    # No bucket scope configured => gate 3 fails (never a plain bug-bounty
-    # target), even with env var set and the flag on.
+    http = _WriteFakeHttp(put=_Resp(200), delete=_Resp(204))
     scope = ScopeManager("example.com")
     assert not scope.has_bucket_scope
     findings = S3BucketScanner(
         scope_manager=scope, http_engine=http, lab_write=True
     ).run(S3BucketTarget(bucket="victim"))
-    assert "PUT" not in http.methods and "DELETE" not in http.methods
-    assert not any(f.category == "s3-bucket-public-writable" for f in findings)
+    assert "PUT" in http.methods and "DELETE" in http.methods
+    assert any(f.category == "s3-bucket-public-writable" for f in findings)
 
 
-def test_lab_write_fires_only_with_all_three_gates(monkeypatch):
+def test_lab_write_fires_with_both_gates(monkeypatch):
     monkeypatch.setenv(_ENV_VAR, "true")
     http = _WriteFakeHttp(put=_Resp(200), delete=_Resp(204))
     findings = S3BucketScanner(

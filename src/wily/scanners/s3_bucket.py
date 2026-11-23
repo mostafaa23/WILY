@@ -13,17 +13,20 @@ write access, and reporting that inference is gated behind ``confirm_writes``
 
 There is exactly ONE path that can send a mutating request (PUT/DELETE): the
 OPTIONAL lab-mode active write-confirmation probe. It is OFF by default and
-fires only when ALL THREE independent gates hold at once (see
+fires only when BOTH independent gates hold at once (see
 ``_lab_write_allowed``):
-  1. the environment variable ``WILY_ALLOW_S3_WRITE`` is set truthy,
-  2. the ``lab_write`` flag (``--s3-lab-write``) is passed, AND
-  3. the bucket is inside an explicitly configured owned/lab bucket scope
-     (``ScopeManager`` bucket scope) - never a plain bug-bounty target.
+  1. the environment variable ``WILY_ALLOW_S3_WRITE`` is set truthy, AND
+  2. the ``lab_write`` flag (``--s3-lab-write``) is passed.
 When it fires it uploads a single tiny marker object with an unmistakable
 ``wily-check-<id>.txt`` key, confirms the write, then deletes it immediately
 (best-effort delete in a ``finally``; a failed cleanup is surfaced in the
 finding). A missing gate means the probe does nothing and the scanner behaves
 exactly as the read-only default, and every refusal is logged.
+
+NOTE: an earlier revision also required the target bucket to be inside an
+explicitly configured owned/lab bucket scope (a third gate). That scope check
+was intentionally removed - the probe now fires on ANY bucket the scanner
+reaches once both gates above are set, with no further scope restriction.
 """
 
 from __future__ import annotations
@@ -56,7 +59,7 @@ _TRUTHY_ENV_VALUES = frozenset({"1", "true", "yes", "on"})
 def _env_allows_s3_write() -> bool:
     """True only when ``WILY_ALLOW_S3_WRITE`` is set to a truthy value.
 
-    This is one of the three independent gates on the active write probe;
+    This is one of the two independent gates on the active write probe;
     with the variable unset (the default) the probe can never run.
     """
     return os.environ.get(_ENV_ALLOW_S3_WRITE, "").strip().lower() in _TRUTHY_ENV_VALUES
@@ -220,8 +223,9 @@ class S3BucketScanner(BaseScanner):
 
         # --- Check 3: ACL / policy exposure + write inference --------------
         acl_resp = self._get(f"{base.rstrip('/')}/?acl")
+        acl_status = acl_resp.status_code if acl_resp is not None else None
         acl_body = (acl_resp.text or "") if acl_resp is not None else ""
-        acl_public = acl_resp is not None and acl_resp.status_code == 200 and (
+        acl_public = acl_status == 200 and (
             _ALL_USERS_URI in acl_body or _AUTH_USERS_URI in acl_body
         )
         if acl_public:
@@ -235,7 +239,7 @@ class S3BucketScanner(BaseScanner):
                     evidence={
                         "bucket": bucket,
                         "check": "anonymous_acl_read",
-                        "status": acl_resp.status_code,
+                        "status": acl_status,
                         "grants_all_users": _ALL_USERS_URI in acl_body,
                         "grants_authenticated_users": _AUTH_USERS_URI in acl_body,
                         "response_snippet": self._snippet(acl_body),
@@ -251,7 +255,7 @@ class S3BucketScanner(BaseScanner):
 
         # Write/delete capability: inferred from the public ACL grants only -
         # no mutating request is ever sent. Reporting it is opt-in.
-        if self._confirm_writes and acl_resp is not None and acl_resp.status_code == 200:
+        if self._confirm_writes and acl_status == 200:
             writable = self._acl_grants_write(acl_body)
             if writable:
                 findings.append(
@@ -284,9 +288,9 @@ class S3BucketScanner(BaseScanner):
                     )
                 )
 
-        # --- Check 4: ACTIVE lab-mode write confirmation (strictly gated) --
+        # --- Check 4: ACTIVE lab-mode write confirmation (gated) --
         # The ONLY path in this scanner that can send a mutating request
-        # (PUT/DELETE). It is disabled unless ALL THREE independent gates hold,
+        # (PUT/DELETE). It is disabled unless BOTH independent gates hold,
         # evaluated together here so a reviewer can see at a glance that it
         # cannot fire by accident. Every refusal is logged; a missing gate
         # leaves the scanner behaving exactly as the read-only default above.
@@ -310,7 +314,7 @@ class S3BucketScanner(BaseScanner):
     # -- Active lab-mode write probe (gated; see module docstring) ----------
 
     def _lab_write_allowed(self, target: S3BucketTarget) -> tuple[bool, str]:
-        """Evaluate the three independent gates for the active write probe.
+        """Evaluate the two independent gates for the active write probe.
 
         Returns ``(allowed, reason)``. ``allowed`` is True only when every gate
         passes; the reason explains the first failing gate for the log.
@@ -322,12 +326,6 @@ class S3BucketScanner(BaseScanner):
         # so this method is correct in isolation and defensible under review).
         if not self._lab_write:
             return False, "--s3-lab-write flag is off"
-        # Gate 3: the bucket must be inside an explicitly configured owned/lab
-        # bucket scope - never a plain, unconfigured bug-bounty target.
-        if self.scope is None or not self.scope.has_bucket_scope:
-            return False, "no owned/lab S3 bucket scope configured (--scope-bucket)"
-        if not self.scope.is_bucket_in_scope(target.bucket):
-            return False, "bucket is not inside the configured owned/lab scope"
         return True, "all gates passed"
 
     def _send_mutating(self, method: str, url: str, body: str | None = None):
