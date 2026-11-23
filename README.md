@@ -209,12 +209,17 @@ Wily is a **detection-oriented** scanner intended for authorized testing only.
 
 - It enforces a target **scope** and refuses out-of-scope hosts; local
   addresses require an explicit `--allow-local`.
-- Cloud-storage and S3 checks are **read-only** — Wily reads bucket
-  ACLs/policies and never issues `PUT`/`DELETE`, so it cannot overwrite or
-  delete objects.
+- Cloud-storage and S3 checks are **read-only by default** — Wily reads
+  bucket ACLs/policies and infers write exposure from them; it does not issue
+  `PUT`/`DELETE` unless the optional active write probe below is explicitly
+  enabled.
 - Genuinely offensive behaviors are opt-in and clearly flagged: write-method
   authorization probes (`--no-destructive` to disable), SSRF/IMDS checks
-  (`--no-owned-infra` to disable), and blind SSRF (`--blind`).
+  (`--no-owned-infra` to disable), blind SSRF (`--blind`), and an active S3
+  write-confirmation probe (`--s3-lab-write`, OFF by default, also requires
+  `WILY_ALLOW_S3_WRITE=true`) that uploads and immediately deletes one marker
+  object to confirm write access - it is **not** limited to a declared
+  owned/lab bucket scope, so only enable it against buckets you control.
 - Captured secrets in reports are **redacted by default**.
 
 Only run Wily against systems you own or have explicit, written permission to

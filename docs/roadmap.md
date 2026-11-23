@@ -135,14 +135,19 @@ explicitly turned on.
 
 **Added — OPTIONAL lab-mode active write probe** (`scanners/s3_bucket.py`,
 `lab_write` / `--s3-lab-write`): a single-marker `PUT`+`DELETE` confirmation that
-is **OFF by default** and triple-gated. It can send a mutating request only when
-**all three** independent gates hold at once (`_lab_write_allowed`):
-1. env var `WILY_ALLOW_S3_WRITE=true`,
-2. the `--s3-lab-write` flag is passed, AND
-3. the bucket is inside an explicitly configured owned/lab bucket scope
-   (`--scope-bucket`) — never a plain, unconfigured bug-bounty target.
+is **OFF by default**. It can send a mutating request only when **both**
+independent gates hold at once (`_lab_write_allowed`):
+1. env var `WILY_ALLOW_S3_WRITE=true`, AND
+2. the `--s3-lab-write` flag is passed.
 
-If any gate is missing the probe does nothing (the scanner behaves exactly as
+**Note (intentional change):** an earlier revision also required the target
+bucket to be inside an explicitly configured owned/lab bucket scope
+(`--scope-bucket`) as a third gate. That scope check was deliberately removed -
+the probe now fires on **any** bucket the scanner reaches once both gates
+above are set, with no further restriction. `--scope-bucket` still exists for
+other scope-aware checks; it just no longer limits this probe.
+
+If a gate is missing the probe does nothing (the scanner behaves exactly as
 the read-only default) and the refusal is logged. When it fires it uploads the
 smallest possible marker object with an unmistakable `wily-check-<random>.txt`
 key, confirms the write, then **deletes it immediately** (best-effort `DELETE`
@@ -153,9 +158,9 @@ in a `finally`; a failed cleanup is surfaced in the finding). The resulting
 active lab-mode confirmation, as opposed to the ACL-derived inference
 (`check=write_permission_inferred_from_acl`). Wired through `app.py` and
 `scan_all.py` (default OFF everywhere). Covered by tests proving the probe is
-skipped when the env var is unset, when the flag is off, and when the scope is
-not owned, and that only with all three gates does a (faked) `PUT`+`DELETE`
-happen — including that a failed cleanup is reported.
+skipped when the env var is unset and when the flag is off, and that it fires
+(faked `PUT`+`DELETE`) once both gates are set, including on an out-of-scope
+bucket — and that a failed cleanup is reported.
 
 ---
 
@@ -168,5 +173,6 @@ happen — including that a failed cleanup is reported.
 3. **Phase 3 (cloud-enum automation)** — builds on the combos just added.
 4. **Phase 4 (token/identity automation)** — start with the file-based pool.
 5. **Phase 5 (S3 write)** — DONE: read-only stays the default; an optional,
-   triple-gated (`WILY_ALLOW_S3_WRITE` + `--s3-lab-write` + owned `--scope-bucket`)
-   lab-mode marker `PUT`/`DELETE` was added, default OFF.
+   two-gated (`WILY_ALLOW_S3_WRITE` + `--s3-lab-write`) lab-mode marker
+   `PUT`/`DELETE` was added, default OFF. The bucket-scope gate was removed
+   intentionally - it is NOT limited to an owned/lab `--scope-bucket`.
