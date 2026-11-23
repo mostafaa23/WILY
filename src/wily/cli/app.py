@@ -47,7 +47,10 @@ app = typer.Typer(
     name="wily",
     help="Cloud-native, black-box API security scanner.",
     add_completion=True,
-    no_args_is_help=True,
+    # The callback (invoke_without_command=True) prints the banner and then the
+    # help on a bare ``wily``, so we must NOT let Typer short-circuit to help
+    # before the callback runs.
+    no_args_is_help=False,
     context_settings={"help_option_names": ["-h", "--help"]},
 )
 
@@ -399,14 +402,21 @@ def _version_callback(value: bool) -> None:
         raise typer.Exit()
 
 
-@app.callback()
+@app.callback(invoke_without_command=True)
 def main_callback(
+    ctx: typer.Context,
     quiet: bool = typer.Option(False, "--quiet", "-q", help="Don't print the banner."),
     version: bool = typer.Option(
         False, "--version", callback=_version_callback, is_eager=True, help="Print the version and exit."
     ),
 ) -> None:
+    # Print the banner on every invocation (like nuclei), unless --quiet.
     print_banner(quiet=quiet)
+    # Bare ``wily`` with no sub-command: show the banner, then the help, and
+    # exit cleanly - instead of a "Missing command" error.
+    if ctx.invoked_subcommand is None:
+        typer.echo(ctx.get_help())
+        raise typer.Exit()
 
 
 def main() -> None:

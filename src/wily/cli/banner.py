@@ -21,6 +21,7 @@ _ASCII_LOGO = r"""
 """
 
 TAGLINE = "Cloud-native, black-box API security scanner"
+HOMEPAGE = "https://github.com/mostafaa23/wily"
 
 
 def print_banner(quiet: bool = False) -> None:
@@ -29,8 +30,15 @@ def print_banner(quiet: bool = False) -> None:
     if quiet:
         return
 
+    def _mark(text: str) -> None:
+        _console_err.print(
+            f"[white][[/white][bold cyan]*[/bold cyan][white]][/white] {text}"
+        )
+
     _console_err.print(f"[bold cyan]{_ASCII_LOGO}[/bold cyan]")
-    _console_err.print(f"[white][[/white][bold cyan]*[/bold cyan][white]][/white] "
-                        f"Wily - {TAGLINE}")
-    _console_err.print(f"[white][[/white][bold cyan]*[/bold cyan][white]][/white] "
-                        f"Version {__version__}\n")
+    _mark(f"Wily - {TAGLINE}")
+    _mark(f"Version {__version__}")
+    _mark(f"[dim]{HOMEPAGE}[/dim]")
+    _console_err.print(
+        "[yellow]Use responsibly: scan only targets you are authorized to test.[/yellow]\n"
+    )
