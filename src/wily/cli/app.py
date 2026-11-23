@@ -45,7 +45,14 @@ logger = logging.getLogger("wily.cli")
 
 app = typer.Typer(
     name="wily",
-    help="Cloud-native, black-box API security scanner.",
+    help=(
+        "Cloud-native, black-box API security scanner.\n\n"
+        "Discovers a target's real endpoints, routes each one to the right "
+        "checks (Auth Bypass, CORS, SSRF, JWT, BOLA, IAM), triages the "
+        "findings by real evidence, and writes unified JSON / HTML / SARIF "
+        "reports. 'scan' runs the whole bundle automatically; the other "
+        "commands run a single module on its own."
+    ),
     add_completion=True,
     # The callback (invoke_without_command=True) prints the banner and then the
     # help on a bare ``wily``, so we must NOT let Typer short-circuit to help
@@ -402,7 +409,30 @@ def _version_callback(value: bool) -> None:
         raise typer.Exit()
 
 
-@app.callback(invoke_without_command=True)
+_MAIN_EPILOG = """
+[bold]Examples[/bold]
+
+  [dim]# Full scan of one target, all three report formats[/dim]
+  wily scan https://api.example.com -o report --format json,html,sarif
+
+  [dim]# Several targets - a separate report for each[/dim]
+  wily scan a.example.com b.example.com --output-dir reports/
+
+  [dim]# JWT checks with a token, and fail a CI build on High+ findings[/dim]
+  wily scan https://api.example.com --token "$JWT" --fail-on high
+
+  [dim]# Run a single focused module[/dim]
+  wily jwt https://api.example.com --token "$JWT"
+  wily iam --iam-file account-auth-details.json
+
+[bold]Per-command help[/bold]
+
+  Every command has its own detailed options. See them with:
+  wily COMMAND -h     [dim](e.g. wily scan -h, wily jwt -h, wily ssrf -h)[/dim]
+"""
+
+
+@app.callback(invoke_without_command=True, epilog=_MAIN_EPILOG)
 def main_callback(
     ctx: typer.Context,
     quiet: bool = typer.Option(False, "--quiet", "-q", help="Don't print the banner."),
