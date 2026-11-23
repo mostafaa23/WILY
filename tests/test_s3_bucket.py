@@ -7,6 +7,9 @@ these tests assert.
 
 from dataclasses import dataclass
 
+import pytest
+
+from wily.core.scope_manager import ScopeManager
 from wily.scanners.s3_bucket import S3BucketScanner, S3BucketTarget, s3_base_url, s3_host_for
 
 _ALL_USERS = "http://acs.amazonaws.com/groups/global/AllUsers"
@@ -116,3 +119,161 @@ def test_private_bucket_yields_nothing():
     })
     findings = S3BucketScanner(http_engine=http).run(S3BucketTarget(bucket="victim"))
     assert findings == []
+
+
+# ---------------------------------------------------------------------------
+# Phase 5: OPTIONAL lab-mode ACTIVE write-confirmation probe.
+#
+# The probe may send a real PUT/DELETE, so it is triple-gated: env var
+# WILY_ALLOW_S3_WRITE=true, the --s3-lab-write flag (lab_write=True), AND the
+# bucket inside an owned/lab bucket scope. These tests use a scripted fake
+# engine (no real S3) and assert the probe fires ONLY when all three hold.
+# ---------------------------------------------------------------------------
+
+_ENV_VAR = "WILY_ALLOW_S3_WRITE"
+
+
+class _WriteFakeHttp:
+    """Records every (method, url, body) and answers PUT/DELETE explicitly.
+
+    Read checks (GET) return a benign 404 so they contribute no findings,
+    isolating the active-write path under test.
+    """
+
+    def __init__(self, put=None, delete=None):
+        self.calls = []
+        self._put = put or _Resp(200)
+        self._delete = delete or _Resp(204)
+
+    def request(self, method, url, headers=None, body=None):
+        self.calls.append((method, url, body))
+        if method == "PUT":
+            return self._put
+        if method == "DELETE":
+            return self._delete
+        return _Resp(404, "<Error><Code>NoSuchKey</Code></Error>")
+
+    @property
+    def methods(self):
+        return [m for m, _u, _b in self.calls]
+
+
+def _owned_scope():
+    """A scope that both names the domain target and declares 'victim' an
+    owned/lab bucket (so gate 3 can pass)."""
+    return ScopeManager("example.com", s3_buckets=("victim",))
+
+
+def test_lab_write_skipped_when_env_var_unset(monkeypatch):
+    monkeypatch.delenv(_ENV_VAR, raising=False)
+    http = _WriteFakeHttp()
+    findings = S3BucketScanner(
+        scope_manager=_owned_scope(), http_engine=http, lab_write=True
+    ).run(S3BucketTarget(bucket="victim"))
+    # Gate 1 (env var) fails: no mutating request, no active finding.
+    assert "PUT" not in http.methods and "DELETE" not in http.methods
+    assert not any(f.category == "s3-bucket-public-writable" for f in findings)
+
+
+def test_lab_write_skipped_when_flag_off(monkeypatch):
+    monkeypatch.setenv(_ENV_VAR, "true")
+    http = _WriteFakeHttp()
+    # lab_write defaults False: gate 2 fails even though env + scope are fine.
+    findings = S3BucketScanner(
+        scope_manager=_owned_scope(), http_engine=http
+    ).run(S3BucketTarget(bucket="victim"))
+    assert "PUT" not in http.methods and "DELETE" not in http.methods
+    assert not any(f.category == "s3-bucket-public-writable" for f in findings)
+
+
+def test_lab_write_skipped_when_scope_not_owned(monkeypatch):
+    monkeypatch.setenv(_ENV_VAR, "true")
+    http = _WriteFakeHttp()
+    # No bucket scope configured => gate 3 fails (never a plain bug-bounty
+    # target), even with env var set and the flag on.
+    scope = ScopeManager("example.com")
+    assert not scope.has_bucket_scope
+    findings = S3BucketScanner(
+        scope_manager=scope, http_engine=http, lab_write=True
+    ).run(S3BucketTarget(bucket="victim"))
+    assert "PUT" not in http.methods and "DELETE" not in http.methods
+    assert not any(f.category == "s3-bucket-public-writable" for f in findings)
+
+
+def test_lab_write_fires_only_with_all_three_gates(monkeypatch):
+    monkeypatch.setenv(_ENV_VAR, "true")
+    http = _WriteFakeHttp(put=_Resp(200), delete=_Resp(204))
+    findings = S3BucketScanner(
+        scope_manager=_owned_scope(), http_engine=http, lab_write=True
+    ).run(S3BucketTarget(bucket="victim"))
+
+    # A (faked) PUT then DELETE actually happened, in that order.
+    assert "PUT" in http.methods
+    assert "DELETE" in http.methods
+    assert http.methods.index("PUT") < http.methods.index("DELETE")
+    # Both target the unmistakable marker key, and the DELETE cleans up the
+    # exact object that was PUT.
+    put_url = next(u for m, u, _b in http.calls if m == "PUT")
+    del_url = next(u for m, u, _b in http.calls if m == "DELETE")
+    assert "/wily-check-" in put_url and put_url.endswith(".txt")
+    assert del_url == put_url
+
+    writable = [f for f in findings if f.category == "s3-bucket-public-writable"]
+    assert len(writable) == 1
+    ev = writable[0].evidence
+    assert ev["check"] == "write_permission_confirmed_active_lab_put"
+    assert ev["active_probe"] is True
+    assert ev["cleanup_ok"] is True
+    assert "cleanup_failed" not in ev
+    assert writable[0].severity == "critical"
+
+
+def test_lab_write_not_reported_when_put_rejected(monkeypatch):
+    monkeypatch.setenv(_ENV_VAR, "true")
+    # A 403 PUT means the bucket is NOT writable: nothing is created and no
+    # finding is emitted, but cleanup is still attempted (harmless no-op).
+    http = _WriteFakeHttp(put=_Resp(403), delete=_Resp(404))
+    findings = S3BucketScanner(
+        scope_manager=_owned_scope(), http_engine=http, lab_write=True
+    ).run(S3BucketTarget(bucket="victim"))
+    assert "PUT" in http.methods  # the probe tried
+    assert not any(f.category == "s3-bucket-public-writable" for f in findings)
+
+
+def test_lab_write_surfaces_failed_cleanup(monkeypatch):
+    monkeypatch.setenv(_ENV_VAR, "true")
+    # PUT succeeds (bucket writable) but the cleanup DELETE is refused: the
+    # finding must warn that the marker object may still exist.
+    http = _WriteFakeHttp(put=_Resp(200), delete=_Resp(403))
+    findings = S3BucketScanner(
+        scope_manager=_owned_scope(), http_engine=http, lab_write=True
+    ).run(S3BucketTarget(bucket="victim"))
+    writable = [f for f in findings if f.category == "s3-bucket-public-writable"]
+    assert len(writable) == 1
+    ev = writable[0].evidence
+    assert ev["cleanup_ok"] is False
+    assert ev["cleanup_failed"] is True
+    assert "may still exist" in ev["cleanup_warning"]
+    assert "cleanup of the marker object FAILED" in writable[0].remediation
+
+
+@pytest.mark.parametrize("env_value", ["false", "0", "no", "", "  "])
+def test_lab_write_env_var_must_be_truthy(monkeypatch, env_value):
+    monkeypatch.setenv(_ENV_VAR, env_value)
+    http = _WriteFakeHttp()
+    S3BucketScanner(
+        scope_manager=_owned_scope(), http_engine=http, lab_write=True
+    ).run(S3BucketTarget(bucket="victim"))
+    # A non-truthy env value is treated as "off": no mutating request.
+    assert "PUT" not in http.methods and "DELETE" not in http.methods
+
+
+def test_read_only_default_sends_no_put_or_delete(monkeypatch):
+    # Belt-and-braces: even with env var set, the DEFAULT scanner (no
+    # lab_write) never sends a mutating request.
+    monkeypatch.setenv(_ENV_VAR, "true")
+    http = _WriteFakeHttp()
+    S3BucketScanner(scope_manager=_owned_scope(), http_engine=http).run(
+        S3BucketTarget(bucket="victim")
+    )
+    assert all(m == "GET" for m in http.methods)

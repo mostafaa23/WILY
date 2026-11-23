@@ -44,6 +44,15 @@ def run(
         False, "--allow-custom-headers",
         help="Enable only if the endpoint actually lets you set headers via a query param (rare).",
     ),
+    probe_host_header: bool = typer.Option(
+        False, "--probe-host-header",
+        help=(
+            "With --blind, also inject the canary into the Host header "
+            "(level 4b). Off by default: overriding Host can break the "
+            "target's routing. The other forwarding headers are always probed "
+            "under --blind."
+        ),
+    ),
     allow_local: bool = typer.Option(False, "--allow-local", help="Allow scanning 127.0.0.1/localhost (local testing only)."),
     confirm_owned_infra: bool = typer.Option(
         True, "--confirm-owned-infra/--no-owned-infra",
@@ -73,6 +82,7 @@ def run(
             supports_custom_method=allow_custom_method,
             supports_custom_headers=allow_custom_headers,
             canary_server=canary,
+            probe_host_header=probe_host_header,
         )
 
         root_host = urlparse(url).hostname

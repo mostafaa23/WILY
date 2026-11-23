@@ -195,6 +195,15 @@ class AuthzBypassScanner(BaseScanner):
         for method in candidate_methods:
             resp = unauth_responses[method]
             body = getattr(resp, "text", "") or ""
+
+            # A 200 with no body is not a *data* leak for a read method: nothing
+            # was returned to leak. HEAD never carries a body, and some GETs
+            # answer 200 empty. Destructive methods are deliberately left in -
+            # an accepted unauthenticated write/delete is a real finding even
+            # with an empty body - so this only drops safe-method noise.
+            if method in _SAFE_METHODS and not body.strip():
+                continue
+
             if self._looks_like_auth_error_body(body, target.auth_error_body_signatures):
                 # soft-200 denial - not a real data leak, do not report
                 continue

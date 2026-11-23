@@ -84,7 +84,7 @@ def test_send_posts_base64_event_to_default_endpoint(tmp_path):
     )
 
     assert len(calls) == 1
-    url, event, timeout = calls[0]
+    url, event, _timeout = calls[0]
     assert url == DEFAULT_REPORT_ENDPOINT
     assert event["recipient"] == "tester@example.com"
     assert event["subject"] == "Wily scan report"

@@ -119,4 +119,17 @@ def derive_followups(findings: list, context: TriggerContext) -> list[FollowUp]:
         ):
             _add("iam_privesc", asset, "leaked cloud credentials -> analyze IAM privilege escalation")
 
+        # An IAM/ARN clue (role name, ARN, AssumeRole snippet, account id) found
+        # in black-box recon is only an identifier, not a credential - but when
+        # the tester supplied an IAM authorization-details file, it seeds/
+        # strengthens the iam_privesc analysis: the leaked principal can be
+        # looked up and its reachable escalation paths reported. Without an IAM
+        # file there is nothing to corroborate it against, so it stays info.
+        if category.startswith("iam-clue-") and context.has_iam_file:
+            _add(
+                "iam_privesc",
+                asset,
+                "IAM clue in black-box recon -> corroborate against provided IAM authorization details",
+            )
+
     return out

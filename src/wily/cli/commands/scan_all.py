@@ -17,6 +17,7 @@ import contextlib
 import json
 import logging
 import re
+import secrets
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -39,7 +40,9 @@ from wily.recon.api_discovery import (
     DiscoveryReport,
 )
 from wily.recon.cloud_enum import (
+    aws_signal_reason,
     azure_account_name,
+    extract_seeds,
     generate_candidates,
     keyword_from_domain,
     load_mutations,
@@ -51,6 +54,7 @@ from wily.recon.parameter_discovery import (
     select_ssrf_candidates,
 )
 from wily.recon.token_harvest import harvest_tokens, redact_jwt
+from wily.recon.token_pool import load_token_pool, select_live_identities
 from wily.recon.traffic_import import ImportedTraffic, import_traffic
 from wily.report.html_report import export_html
 from wily.report.json_report import export_json
@@ -72,6 +76,12 @@ from wily.scanners.base import Finding, ScannerConfirmationError, run_scanner
 from wily.scanners.bola import BolaTester, Identity
 from wily.scanners.cloud_storage import CloudStorageScanner, CloudStorageTarget
 from wily.scanners.http_engine import HttpEngine
+from wily.scanners.iam_clue_scan import (
+    IamClueScanner,
+    IamClueSource,
+    IamClueTarget,
+    looks_like_iac,
+)
 from wily.scanners.iam_privesc import (
     build_privesc_graph,
     filter_principals_in_scope,
@@ -189,6 +199,48 @@ def _print_scan_summary(status: Console, rows: list[tuple], out_dir: Path) -> No
         f"[green][+][/green] Done. {len(rows)} scanned, {with_findings} with "
         f"findings, {total} total. Reports in [bold]{out_dir.resolve()}[/bold]."
     )
+
+
+def _soft_404_probe_url(ep_url: str, token: str | None = None) -> str:
+    """Build a sibling URL that almost certainly does not exist on the target.
+
+    The last path segment of ``ep_url`` is replaced with a random marker
+    (``/api/users/1`` -> ``/api/users/wily-nx-<hex>``); a root URL becomes
+    ``/wily-nx-<hex>``. Query and fragment are dropped. The Auth Bypass
+    scanner fetches this once and suppresses a "missing authorizer" hit whose
+    body matches it - the endpoint is then a catch-all / SPA shell / soft-404,
+    not a real unauthenticated data leak. Using a sibling (same parent path)
+    rather than a host-wide random path also catches per-prefix catch-alls
+    such as ``/api/*`` that answer every unknown route with the same JSON.
+    """
+    parsed = urlparse(ep_url)
+    marker = f"wily-nx-{token or secrets.token_hex(6)}"
+    segments = parsed.path.split("/")
+    # Drop a trailing empty segment ("/a/b/" -> ["", "a", "b"]) so the marker
+    # replaces "b", not the empty string after the slash.
+    while len(segments) > 1 and segments[-1] == "":
+        segments.pop()
+    if len(segments) <= 1:
+        new_path = f"/{marker}"
+    else:
+        segments[-1] = marker
+        new_path = "/".join(segments)
+    return parsed._replace(path=new_path, params="", query="", fragment="").geturl()
+
+
+_CLOUD_ENUM_DEFAULT_CAP = 400
+_CLOUD_ENUM_COMBOS_DEFAULT_CAP = 3000
+
+
+def _cloud_enum_cap(explicit: int | None, combos: bool, n_keywords: int = 1) -> int:
+    """Resolve --cloud-enum-max: an explicit value wins; otherwise 400 per
+    keyword (enough for the full built-in two-part list) or 3000 per keyword
+    with combos. Scaling by keyword count keeps a second keyword from being
+    starved, since names are generated keyword-first."""
+    if explicit is not None:
+        return explicit
+    per_kw = _CLOUD_ENUM_COMBOS_DEFAULT_CAP if combos else _CLOUD_ENUM_DEFAULT_CAP
+    return per_kw * max(1, n_keywords)
 
 
 def _want_canary(*, blind: bool, auto_canary: bool, confirm_owned_infra: bool) -> bool:
@@ -433,17 +485,20 @@ async def run_full_scan(
     allow_local: bool,
     blind: bool,
     output: str,
+    token_pool: str | None = None,
     auto_token: bool = True,
     auto_canary: bool = True,
     report_formats: list[str] | None = None,
     confirm_destructive: bool = True,
     confirm_owned_infra: bool = True,
     confirm_s3_writes: bool = False,
+    s3_lab_write: bool = False,
     probe_live: bool = False,
     cloud_enum: bool = False,
     cloud_keywords: list[str] | None = None,
     cloud_enum_wordlist: str | None = None,
-    cloud_enum_max: int = 300,
+    cloud_enum_max: int | None = None,
+    cloud_enum_combos: bool = False,
     show_leak: bool = False,
     burp_xml: str | None = None,
     import_har: str | None = None,
@@ -724,21 +779,71 @@ async def run_full_scan(
         rate_limiter=rate_limiter,
         allow_local=allow_local,
         confirm_s3_writes=confirm_s3_writes,
+        s3_lab_write=s3_lab_write,
     )
 
-    # --- Cloud resource enumeration (cloud_enum-style). Opt-in: generate
-    # candidate names from the target keyword(s) and probe AWS S3 / Azure Blob /
-    # GCP for existing/open storage, auto-handing AWS hits to the deep s3_bucket
-    # scanner. Keyword-driven, so it runs even with no HTTP endpoints. ---
+    # --- Cloud resource enumeration (cloud_enum-style). Opt-in via --cloud-enum:
+    # generate candidate names from the target keyword(s) and probe AWS S3 /
+    # Azure Blob / GCP for existing/open storage, auto-handing AWS hits to the
+    # deep s3_bucket scanner. Keyword-driven, so it runs even with no HTTP
+    # endpoints. ---
+    #
+    # Phase 3 makes it context-aware and budget-safe:
+    #   * Seed extraction: mine extra keywords automatically from material the
+    #     scan already gathered (endpoint/S3 URLs, imported traffic, and the
+    #     org tokens Phase 1 already surfaced in findings) so generation no
+    #     longer depends only on --cloud-keyword.
+    #   * Auto-trigger: when an AWS signal is observed (amazonaws.com, s3://,
+    #     an ARN/IAM clue from Phase 1, or a matching finding) enable the pass
+    #     even without --cloud-enum. It stays behind the same per-keyword budget
+    #     cap and per-host scope enforcement, and only ever probes names derived
+    #     from the authorized target, so scope is never widened.
+    cloud_seed_texts: list[str] = [str(ep) for ep in endpoints]
+    if imported:
+        cloud_seed_texts += list(imported.s3_links) + list(imported.endpoints)
+    for f in all_findings:
+        cloud_seed_texts.append(str(getattr(f, "asset", "")))
+        ev = getattr(f, "evidence", None)
+        if isinstance(ev, dict):
+            cloud_seed_texts += [v for v in ev.values() if isinstance(v, str)]
+
+    auto_reason: str | None = None
+    if not cloud_enum:
+        auto_reason = aws_signal_reason(
+            findings_categories=[getattr(f, "category", "") for f in all_findings],
+            texts=cloud_seed_texts,
+        )
+        if auto_reason:
+            cloud_enum = True
+
     if cloud_enum:
+        # Keep auto-derived seeds small so the per-keyword cap stays a tight
+        # overall bound (a handful of extra keywords, never dozens).
+        seeds = extract_seeds(domain=root_domain, texts=cloud_seed_texts, max_seeds=6)
+        merged_keywords = list(cloud_keywords or [])
+        for seed in seeds:
+            if seed not in merged_keywords:
+                merged_keywords.append(seed)
+        if auto_reason:
+            console.print(
+                f"[cyan][*][/cyan] Cloud enum auto-triggered: {auto_reason}. "
+                "Read-only, budget-capped, same scope - pass --no-cloud-enum to "
+                "opt out."
+            )
+        if seeds:
+            console.print(
+                f"[cyan][*][/cyan] Cloud enum: +{len(seeds)} auto-extracted "
+                f"seed keyword(s) ({', '.join(seeds)})."
+            )
         await _run_cloud_enum(
             all_findings=all_findings,
             scanned=scanned,
             s3_scan_targets=s3_scan_targets,
             root_domain=root_domain,
-            keywords=cloud_keywords or [],
+            keywords=merged_keywords,
             wordlist_path=cloud_enum_wordlist,
             max_candidates=cloud_enum_max,
+            combos=cloud_enum_combos,
             rate_limiter=rate_limiter,
             allow_local=allow_local,
         )
@@ -804,6 +909,10 @@ async def run_full_scan(
                     AuthzBypassTarget(
                         url=ep_url,
                         include_destructive_methods=confirm_destructive,
+                        # Differential baseline: without it, every catch-all /
+                        # SPA route or public page that answers 200 with no
+                        # auth is reported as a critical missing authorizer.
+                        soft_404_probe_url=_soft_404_probe_url(ep_url),
                     ),
                 )
                 all_findings += await run_scanner(
@@ -894,16 +1003,54 @@ async def run_full_scan(
             canary.stop()
 
     identities = _parse_identities(identities_raw)
+    # Fill BOLA identities from a saved token/session pool file when fewer than
+    # two were supplied explicitly. Explicit --identity values always win and
+    # keep their slots; the pool only tops up to two, using live-only entries
+    # (a cheap read-only GET that returns 200 against the base target). See
+    # recon/token_pool.py. Raw tokens are never printed - only a redacted label.
+    if token_pool and len(identities) < 2:
+        pool = load_token_pool(token_pool)
+        taken = {i.name for i in identities}
+        candidates = [p for p in pool if p.name not in taken]
+        if candidates:
+            console.print(
+                f"[cyan][*][/cyan] BOLA: token pool has {len(candidates)} candidate "
+                "identit(y/ies); checking which are live ..."
+            )
+            try:
+                live = await asyncio.to_thread(
+                    select_live_identities,
+                    candidates, target_url, http_engine,
+                    want=2 - len(identities),
+                )
+            except Exception as e:  # liveness must never abort a scan
+                live = []
+                console.print(f"[yellow][!][/yellow] BOLA: token-pool liveness check skipped: {e}")
+            for ident in live:
+                console.print(f"[cyan][*][/cyan] BOLA: pooled identity '{ident.name}' is live - using it.")
+                identities.append(ident)
+        elif pool:
+            console.print(
+                "[yellow][!][/yellow] BOLA: token-pool identities duplicate the "
+                "explicit --identity names; nothing to add."
+            )
+
     if len(identities) >= 2:
         console.print(f"[cyan][*][/cyan] BOLA: testing with {len(identities)} identities ...")
         tester = BolaTester(identities=identities, min_confidence="LOW", scope_manager=scope)
         bola_findings = await tester.run(report)
         all_findings += [_bola_to_finding(bf) for bf in bola_findings]
         console.print(f"[cyan][*][/cyan] BOLA: {len(bola_findings)} finding(s).")
-    elif identities_raw:
+        # Record which endpoints the broad pass already covered (every
+        # discovery-flagged bola_candidate), so a finding-driven bola follow-up
+        # below only runs on authz-bypass endpoints the broad pass skipped.
+        for asset in _bola_covered_assets(report):
+            scanned.add(("bola", asset))
+    elif identities_raw or token_pool:
         console.print(
-            "[yellow][!][/yellow] BOLA requires at least two --identity values "
-            "(one identity alone can't be compared) - skipped."
+            "[yellow][!][/yellow] BOLA requires at least two identities "
+            "(one identity alone can't be compared) - supply more --identity "
+            "values or a --token-pool with >=2 live entries. Skipped."
         )
 
     # --- Finding-driven follow-ups: run (or recommend) only the deeper tests
@@ -919,44 +1066,16 @@ async def run_full_scan(
         confirm_s3_writes=confirm_s3_writes,
     )
     followups = derive_followups(all_findings, context)
-    pending = [fu for fu in followups if (fu.scanner, fu.asset) not in scanned]
-    if pending:
-        console.print(f"\n[cyan][*][/cyan] Finding-driven follow-ups: {len(pending)}")
-        for fu in pending:
-            if fu.scanner == "jwt_tamper" and token:
-                try:
-                    all_findings += await run_scanner(
-                        JwtTamperScanner(scope_manager=scope, http_engine=http_engine),
-                        JwtTarget(
-                            url=fu.asset, sample_token=token, check_weak_secret=False
-                        ),
-                    )
-                    scanned.add((fu.scanner, fu.asset))
-                    console.print(f"[cyan]    [>][/cyan] ran {fu.scanner} on {fu.asset} — {fu.reason}")
-                except Exception as e:
-                    console.print(f"[yellow]    [!][/yellow] follow-up {fu.scanner} failed: {e}")
-            elif fu.scanner == "s3_permcheck" and fu.asset in s3_scan_targets:
-                # Deeper S3 step: re-run the bucket with confirm_writes=True so
-                # the (read-only, ACL-derived) write/delete permission check is
-                # evaluated now that a public finding justified it.
-                try:
-                    engine, s3_target = s3_scan_targets[fu.asset]
-                    all_findings += await run_scanner(
-                        S3BucketScanner(
-                            scope_manager=scope,
-                            http_engine=engine,
-                            confirm_writes=True,
-                        ),
-                        s3_target,
-                    )
-                    scanned.add((fu.scanner, fu.asset))
-                    console.print(f"[cyan]    [>][/cyan] ran s3 permission-check on {fu.asset} — {fu.reason}")
-                except Exception as e:
-                    console.print(f"[yellow]    [!][/yellow] follow-up {fu.scanner} failed: {e}")
-            else:
-                # No standalone target available to auto-run this one here;
-                # surface it as a justified next step for the analyst.
-                console.print(f"[cyan]    [>][/cyan] recommend {fu.scanner} on {fu.asset} — {fu.reason}")
+    await _run_followups(
+        followups=followups,
+        all_findings=all_findings,
+        scanned=scanned,
+        scope=scope,
+        http_engine=http_engine,
+        token=token,
+        identities=identities,
+        s3_scan_targets=s3_scan_targets,
+    )
 
     _result = _finish(all_findings, output, show_leak, report_formats, feedback_store, ml_model)
     if artifacts_dir:
@@ -1047,6 +1166,7 @@ async def _run_cloud_scanners(
     rate_limiter,
     allow_local: bool,
     confirm_s3_writes: bool,
+    s3_lab_write: bool = False,
 ) -> None:
     """Run the Phase 3 cloud scanners and fold their findings into the run.
 
@@ -1077,8 +1197,16 @@ async def _run_cloud_scanners(
         target = S3BucketTarget(bucket=bucket, sample_object_key=_s3_object_key(ref))
         try:
             found = await run_scanner(
+                # lab_write forwards the --s3-lab-write flag; the scanner still
+                # refuses the active PUT/DELETE unless WILY_ALLOW_S3_WRITE=true
+                # AND the bucket is inside the configured owned/lab scope, so
+                # passing the shared `scope` (which carries the bucket scope) is
+                # what actually enables it. Default off => read-only as before.
                 S3BucketScanner(
-                    scope_manager=scope, http_engine=engine, confirm_writes=False
+                    scope_manager=scope,
+                    http_engine=engine,
+                    confirm_writes=False,
+                    lab_write=s3_lab_write,
                 ),
                 target,
             )
@@ -1125,6 +1253,38 @@ async def _run_cloud_scanners(
                 )
         except Exception as e:
             console.print(f"[yellow]    [!][/yellow] Secret scan failed: {e}")
+
+    # ---- IAM / ARN clue extraction (Phase 1) ---------------------------
+    # Same corpus as the secret scan (imported-traffic text + discovered JS),
+    # plus any accidentally-exposed IaC files discovery turned up. Surfaces
+    # AWS *identifiers* (ARNs, role names, AssumeRole snippets, account ids) -
+    # informational on their own; the trigger layer escalates them to an
+    # iam_privesc follow-up when an --iam-file was supplied.
+    iam_clue_sources = [
+        IamClueSource(label=s.label, content=s.content, location=s.location)
+        for s in secret_sources
+    ]
+    iac_urls = [
+        ep for ep in endpoints
+        if looks_like_iac(urlparse(ep).path) and scope.is_in_scope(ep)
+    ]
+    iam_clue_fetch = js_urls + iac_urls
+    if iam_clue_sources or iam_clue_fetch:
+        try:
+            found = await run_scanner(
+                IamClueScanner(scope_manager=scope, http_engine=http_engine),
+                IamClueTarget(sources=iam_clue_sources, fetch_urls=iam_clue_fetch),
+            )
+            all_findings += found
+            scanned.add(("iam_clue_scan", root_domain))
+            if found:
+                console.print(
+                    f"[cyan]    [*][/cyan] IAM clue scan: {len(found)} clue(s) "
+                    f"across {len(iam_clue_sources)} source(s) + "
+                    f"{len(js_urls)} JS + {len(iac_urls)} IaC file(s)."
+                )
+        except Exception as e:
+            console.print(f"[yellow]    [!][/yellow] IAM clue scan failed: {e}")
 
     # ---- Subdomain / resource takeover ---------------------------------
     hosts: list[str] = []
@@ -1184,9 +1344,10 @@ async def _run_cloud_enum(
     root_domain: str,
     keywords: list[str],
     wordlist_path: str | None,
-    max_candidates: int,
+    max_candidates: int | None,
     rate_limiter,
     allow_local: bool,
+    combos: bool = False,
 ) -> None:
     """Generate candidate names from keyword(s) and probe AWS/Azure/GCP storage.
 
@@ -1209,11 +1370,20 @@ async def _run_cloud_enum(
         except OSError as e:
             console.print(f"[yellow][!][/yellow] Cloud enum wordlist ignored: {e}")
 
-    candidates = generate_candidates(kws, mutations, max_candidates=max_candidates)
+    cap = _cloud_enum_cap(max_candidates, combos, len(kws))
+    candidates = generate_candidates(kws, mutations, max_candidates=cap, combos=combos)
+    total = len(generate_candidates(kws, mutations, combos=combos))
     console.print(
         f"[cyan][*][/cyan] Cloud enum: {len(candidates)} candidate name(s) from "
-        f"keyword(s) {', '.join(kws)} (AWS/Azure/GCP)."
+        f"keyword(s) {', '.join(kws)} (AWS/Azure/GCP"
+        + (", with three-part combos" if combos else "")
+        + ")."
     )
+    if total > len(candidates):
+        console.print(
+            f"[yellow][!][/yellow] Cloud enum: capped at {len(candidates)} of {total} "
+            "generated names - raise --cloud-enum-max to probe the rest."
+        )
 
     factory = _provider_engine_factory(allow_local, rate_limiter)
     enum_scanner = CloudStorageScanner(engine_factory=factory)
@@ -1259,6 +1429,93 @@ async def _run_cloud_enum(
                 )
         except Exception as e:
             console.print(f"[yellow]    [!][/yellow] s3_bucket deep scan failed for {bucket}: {e}")
+
+
+def _bola_covered_assets(report) -> set[str]:
+    """Endpoints the broad BOLA pass already tested: every discovery-flagged
+    ``bola_candidate`` in the report. Returned as a set of (scanner-side) asset
+    keys so a bola follow-up on one of them is skipped as a duplicate."""
+    covered: set[str] = set()
+    for url, record in getattr(report, "endpoints", {}).items():
+        if (getattr(record, "details", None) or {}).get("bola_candidate"):
+            covered.add(url)
+    return covered
+
+
+async def _run_followups(
+    *,
+    followups: list,
+    all_findings: list,
+    scanned: set,
+    scope,
+    http_engine,
+    token: str | None,
+    identities: list,
+    s3_scan_targets: dict,
+) -> None:
+    """Execute every finding-driven follow-up that has a concrete, safe run
+    path, and surface the rest as a justified next step.
+
+    Auto-run here:
+      - ``jwt_tamper``: deep JWT tampering on an endpoint with broken authz.
+      - ``bola``: cross-tenant replay on an authz-bypass endpoint the broad
+        BOLA pass did not already cover (broken authz is itself a strong BOLA
+        signal, even when discovery never flagged the endpoint a candidate).
+        Read-only (GET replay); needs >= 2 identities.
+      - ``s3_permcheck``: the deeper S3 step - re-run the bucket with
+        ``confirm_writes=True`` so the read-only, ACL-derived write/delete
+        check runs now that a public finding justified it.
+
+    Recommended (not auto-run): ``ssrf_blind`` (the OOB canary is already
+    stopped, and blind SSRF ran inline with it during detection) and
+    ``iam_privesc`` (the supplied IAM file was already analyzed; using the
+    leaked credentials for live enumeration is a separate, manual step).
+    """
+    pending = [fu for fu in followups if (fu.scanner, fu.asset) not in scanned]
+    if not pending:
+        return
+    console.print(f"\n[cyan][*][/cyan] Finding-driven follow-ups: {len(pending)}")
+    for fu in pending:
+        try:
+            if fu.scanner == "jwt_tamper" and token:
+                all_findings += await run_scanner(
+                    JwtTamperScanner(scope_manager=scope, http_engine=http_engine),
+                    JwtTarget(url=fu.asset, sample_token=token, check_weak_secret=False),
+                )
+                scanned.add((fu.scanner, fu.asset))
+                console.print(f"[cyan]    [>][/cyan] ran {fu.scanner} on {fu.asset} — {fu.reason}")
+            elif fu.scanner == "bola" and len(identities) >= 2:
+                # Minimal one-endpoint report, flagged a candidate, so the
+                # broken-authz endpoint is replayed across identities even
+                # though discovery never marked it.
+                mini = DiscoveryReport(target=fu.asset)
+                mini.add_endpoint(
+                    fu.asset, source="followup", methods=["GET"],
+                    details={"bola_candidate": True},
+                )
+                tester = BolaTester(
+                    identities=identities, min_confidence="LOW", scope_manager=scope
+                )
+                bola_findings = await tester.run(mini)
+                all_findings += [_bola_to_finding(bf) for bf in bola_findings]
+                scanned.add((fu.scanner, fu.asset))
+                console.print(f"[cyan]    [>][/cyan] ran bola on {fu.asset} — {fu.reason}")
+            elif fu.scanner == "s3_permcheck" and fu.asset in s3_scan_targets:
+                engine, s3_target = s3_scan_targets[fu.asset]
+                all_findings += await run_scanner(
+                    S3BucketScanner(
+                        scope_manager=scope, http_engine=engine, confirm_writes=True
+                    ),
+                    s3_target,
+                )
+                scanned.add((fu.scanner, fu.asset))
+                console.print(f"[cyan]    [>][/cyan] ran s3 permission-check on {fu.asset} — {fu.reason}")
+            else:
+                # No safe standalone run path here - surface it as a justified
+                # next step for the analyst.
+                console.print(f"[cyan]    [>][/cyan] recommend {fu.scanner} on {fu.asset} — {fu.reason}")
+        except Exception as e:
+            console.print(f"[yellow]    [!][/yellow] follow-up {fu.scanner} failed: {e}")
 
 
 _BOLA_CONFIDENCE_TO_FLOAT = {"HIGH": 0.9, "MEDIUM": 0.6, "LOW": 0.4}

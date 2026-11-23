@@ -15,6 +15,7 @@ the tester actually owns.
 from __future__ import annotations
 
 import re
+import time
 from dataclasses import dataclass, field
 from urllib.parse import urlencode
 
@@ -30,6 +31,34 @@ CREDENTIAL_LEAK_INDICATORS: list[re.Pattern] = [
 ]
 
 _ROLE_NAME_RE = re.compile(r"^[A-Za-z0-9+=,.@_-]+$")
+
+# SSRF-prone request headers an application (or the reverse proxy in front of
+# it) may trust and reflect into a server-side fetch - the "get-my-own-URL" /
+# forwarding patterns that leak SSRF only through *headers*, never through the
+# URL parameter the level-1..4 param probes already cover. Kept small and fixed
+# on purpose: these are the headers most commonly honored by SSRF-prone
+# middleware. Ordered least-to-most disruptive - the X-Forwarded-* / IP hints
+# are safe to send on any request, while ``Host`` is last and gated (see
+# ``SsrfImdsTarget.probe_host_header``) because overriding it can change the
+# target's virtual-host routing.
+SSRF_INJECTABLE_HEADERS: tuple[str, ...] = (
+    "X-Forwarded-Host",
+    "X-Forwarded-For",
+    "X-Real-IP",
+    "Client-IP",
+    "Referer",
+    "Host",
+)
+
+# The one header in the allowlist that can break the target's routing, so it is
+# only probed when the caller explicitly opts in.
+_SENSITIVE_HEADER = "Host"
+
+# Total wall-clock budget for polling the canary across *all* header probes
+# (shared deadline, not per-header), so adding headers to the allowlist can
+# never multiply the worst-case wait. Mirrors the single-shot 5s the param
+# blind probe already uses.
+_HEADER_PROBE_POLL_TIMEOUT = 5.0
 
 # How much of the raw credential response is kept as evidence, after
 # redaction. json_report.py redacts again on export (defense in depth),
@@ -110,6 +139,10 @@ class SsrfImdsTarget:
     proxy_method_param: str = "method"
     proxy_headers_param: str = "headers"
     canary_server: OOBCanaryServer | None = None  # enables level 4 (Blind SSRF)
+    # Also probe the ``Host`` header (level 4b). Off by default: overriding Host
+    # can break the target's virtual-host routing, so it is opt-in even though
+    # the rest of the header allowlist is always probed when a canary is set.
+    probe_host_header: bool = False
 
 
 class SsrfImdsScanner(BaseScanner):
@@ -150,6 +183,28 @@ class SsrfImdsScanner(BaseScanner):
         except Exception:
             return None
         return resp.text
+
+    def _header_probe_fetch(
+        self, target: SsrfImdsTarget, header_name: str, payload_url: str
+    ) -> None:
+        """Send the SSRF-prone endpoint one request that carries ``payload_url``
+        in the request *header* ``header_name`` (no URL-parameter payload - that
+        is the level-1..4 param path's job). The response body is irrelevant
+        here: header-injection SSRF is blind, confirmed only out-of-band via the
+        canary callback, so nothing is returned."""
+        params = dict(target.extra_params)
+        if params:
+            qs = urlencode(params)
+            sep = "&" if "?" in target.url else "?"
+            full_url = f"{target.url}{sep}{qs}"
+        else:
+            full_url = target.url
+        try:
+            self.http.request(
+                method=target.method, url=full_url, headers={header_name: payload_url}
+            )
+        except Exception:
+            return
 
     def _evidence_snippet(self, body: str) -> str:
         """Redact known secret shapes before truncating to the evidence
@@ -320,6 +375,10 @@ class SsrfImdsScanner(BaseScanner):
         if f4:
             findings.append(f4)
 
+        # Level 4b: same blind-SSRF canary, carried in SSRF-prone request
+        # headers instead of the URL parameter.
+        findings.extend(self._try_blind_ssrf_headers(target))
+
         return findings
 
     def _try_blind_ssrf(self, target: SsrfImdsTarget) -> Finding | None:
@@ -367,3 +426,85 @@ class SsrfImdsScanner(BaseScanner):
                 "only in leaking the content."
             ),
         )
+
+    def _try_blind_ssrf_headers(self, target: SsrfImdsTarget) -> list[Finding]:
+        """Level 4b: header-injection blind SSRF.
+
+        Mirrors :meth:`_try_blind_ssrf` but carries the canary URL in a fixed
+        allowlist of SSRF-prone request *headers* (``SSRF_INJECTABLE_HEADERS``)
+        instead of the URL parameter - many SSRFs fire only through forwarding
+        headers the app trusts, never through the user-facing URL param.
+
+        Correlation keeps false positives low: each header gets its own canary
+        token, so the ``unique_id`` is bound to ``(asset, header, check_id)``.
+        A returning hit is matched back to the exact header that fired via the
+        token->header map built here (the token is embedded in the canary URL's
+        path, exactly as the param blind probe correlates its single hit), and
+        the header name is also echoed into the callback path as a
+        human-readable cross-check.
+
+        Same gating as the param blind probe: does nothing unless a canary is
+        configured, so there is no new network behavior when none is set."""
+        if target.canary_server is None:
+            return []
+
+        canary = target.canary_server
+
+        # Fire every header probe first, recording token -> header, then poll
+        # against a single shared deadline. This attributes each hit to exactly
+        # one header while bounding the total wait regardless of allowlist size.
+        probes: list[tuple[str, str, str]] = []  # (token, header, canary_url)
+        for header_name in SSRF_INJECTABLE_HEADERS:
+            if header_name == _SENSITIVE_HEADER and not target.probe_host_header:
+                continue
+            token = canary.new_token()
+            canary_url = canary.url_for(
+                token, path_suffix=f"ssrf-header/{header_name.lower()}"
+            )
+            self._header_probe_fetch(target, header_name, canary_url)
+            probes.append((token, header_name, canary_url))
+
+        findings: list[Finding] = []
+        deadline = time.monotonic() + _HEADER_PROBE_POLL_TIMEOUT
+        for token, header_name, canary_url in probes:
+            remaining = max(0.1, deadline - time.monotonic())
+            hit = canary.wait_for_hit(token, timeout=remaining)
+            if hit is None:
+                continue
+
+            findings.append(
+                Finding(
+                    asset=target.url,
+                    category="cloud-ssrf-blind-header",
+                    severity="high",
+                    confidence=0.85,
+                    discovery_source="scanner",
+                    evidence={
+                        "technique": "blind_ssrf_header_injection",
+                        "injected_header": header_name,
+                        "canary_url": canary_url,
+                        "oob_hit_confirmed": True,
+                        "oob_hit_method": hit.method,
+                        "oob_hit_remote_addr": hit.remote_addr,
+                        "note": (
+                            "Confirmed via OOB callback only - the target made "
+                            f"an outbound request after the {header_name} "
+                            "request header was set to the canary URL, so this "
+                            "header is honored as an SSRF sink. Actual access "
+                            "to real internal data was not confirmed (the "
+                            "response is not returned to the user)."
+                        ),
+                    },
+                    remediation=(
+                        "Do not trust client-supplied request headers "
+                        f"({header_name} here) when building server-side "
+                        "requests or resolving the backend/origin. Strip or "
+                        "override forwarding headers at the edge, and enforce "
+                        "an explicit egress allow-list so a poisoned header "
+                        "cannot steer the server to an attacker-chosen or "
+                        "internal address."
+                    ),
+                )
+            )
+
+        return findings

@@ -5,21 +5,40 @@ Given a bucket reference (bare name, ``s3://bucket/key``, or
 object read, and ACL/policy exposure granting ``AllUsers``/
 ``AuthenticatedUsers`` access.
 
-Safety: every request is a GET - never a PUT/DELETE, so it can never
-mutate a third-party bucket. Write/delete exposure is only *inferred* from
-a readable ACL/policy granting a wildcard principal write access, and
-reporting that inference is gated behind ``confirm_writes``
+Safety: by default every request is a GET - never a PUT/DELETE, so the
+scanner can never mutate a third-party bucket. Write/delete exposure is
+only *inferred* from a readable ACL/policy granting a wildcard principal
+write access, and reporting that inference is gated behind ``confirm_writes``
 (``--confirm-s3-writes``), default off.
+
+There is exactly ONE path that can send a mutating request (PUT/DELETE): the
+OPTIONAL lab-mode active write-confirmation probe. It is OFF by default and
+fires only when ALL THREE independent gates hold at once (see
+``_lab_write_allowed``):
+  1. the environment variable ``WILY_ALLOW_S3_WRITE`` is set truthy,
+  2. the ``lab_write`` flag (``--s3-lab-write``) is passed, AND
+  3. the bucket is inside an explicitly configured owned/lab bucket scope
+     (``ScopeManager`` bucket scope) - never a plain bug-bounty target.
+When it fires it uploads a single tiny marker object with an unmistakable
+``wily-check-<id>.txt`` key, confirms the write, then deletes it immediately
+(best-effort delete in a ``finally``; a failed cleanup is surfaced in the
+finding). A missing gate means the probe does nothing and the scanner behaves
+exactly as the read-only default, and every refusal is logged.
 """
 
 from __future__ import annotations
 
+import logging
+import os
 import re
+import secrets
 from dataclasses import dataclass
 
 from wily.core.scope_manager import ScopeManager, extract_bucket_name
 from wily.scanners.base import BaseScanner, Finding
 from wily.scanners.http_engine import HttpEngine
+
+logger = logging.getLogger("wily.s3_bucket")
 
 # AWS canonical group URIs that mean "anyone" / "any AWS account".
 _ALL_USERS_URI = "http://acs.amazonaws.com/groups/global/AllUsers"
@@ -27,6 +46,32 @@ _AUTH_USERS_URI = "http://acs.amazonaws.com/groups/global/AuthenticatedUsers"
 
 # How much of an ACL/policy/listing body is kept as evidence.
 _EVIDENCE_SNIPPET_LEN = 400
+
+# Env-var gate for the active lab-mode write probe. The canonical value is
+# ``WILY_ALLOW_S3_WRITE=true``; a small set of truthy spellings is accepted.
+_ENV_ALLOW_S3_WRITE = "WILY_ALLOW_S3_WRITE"
+_TRUTHY_ENV_VALUES = frozenset({"1", "true", "yes", "on"})
+
+
+def _env_allows_s3_write() -> bool:
+    """True only when ``WILY_ALLOW_S3_WRITE`` is set to a truthy value.
+
+    This is one of the three independent gates on the active write probe;
+    with the variable unset (the default) the probe can never run.
+    """
+    return os.environ.get(_ENV_ALLOW_S3_WRITE, "").strip().lower() in _TRUTHY_ENV_VALUES
+
+
+@dataclass
+class _WriteProbeResult:
+    """Outcome of a single active marker PUT + cleanup DELETE."""
+
+    marker_key: str
+    put_status: int | None
+    confirmed: bool  # the PUT returned 2xx -> the bucket is genuinely writable
+    delete_status: int | None
+    delete_error: str | None
+    cleanup_ok: bool  # the marker was removed again (best-effort DELETE 2xx)
 
 _LIST_RESULT_RE = re.compile(r"<ListBucketResult", re.IGNORECASE)
 _NO_SUCH_BUCKET_RE = re.compile(r"<Code>\s*NoSuchBucket\s*</Code>", re.IGNORECASE)
@@ -82,10 +127,15 @@ class S3BucketScanner(BaseScanner):
         scope_manager: ScopeManager | None = None,
         http_engine: HttpEngine | None = None,
         confirm_writes: bool = False,
+        lab_write: bool = False,
     ) -> None:
         self.scope = scope_manager
         self.http = http_engine
         self._confirm_writes = confirm_writes
+        # Opt-in flag for the active lab-mode write probe (gate 2 of 3). OFF by
+        # default; even when on, the probe still needs the env var and an
+        # owned/lab bucket scope before it can send a single request.
+        self._lab_write = lab_write
 
     def _get(self, url: str):
         if self.http is None:
@@ -234,7 +284,173 @@ class S3BucketScanner(BaseScanner):
                     )
                 )
 
+        # --- Check 4: ACTIVE lab-mode write confirmation (strictly gated) --
+        # The ONLY path in this scanner that can send a mutating request
+        # (PUT/DELETE). It is disabled unless ALL THREE independent gates hold,
+        # evaluated together here so a reviewer can see at a glance that it
+        # cannot fire by accident. Every refusal is logged; a missing gate
+        # leaves the scanner behaving exactly as the read-only default above.
+        if self._lab_write:
+            allowed, reason = self._lab_write_allowed(target)
+            if not allowed:
+                logger.info(
+                    "S3 active lab-write probe refused for %s: %s", bucket, reason
+                )
+            else:
+                logger.warning(
+                    "S3 active lab-write probe ENABLED for owned/lab bucket %s "
+                    "(env var + flag + owned scope all set); sending a single "
+                    "marker PUT and an immediate DELETE.",
+                    bucket,
+                )
+                findings += self._run_active_lab_write(bucket, base)
+
         return findings
+
+    # -- Active lab-mode write probe (gated; see module docstring) ----------
+
+    def _lab_write_allowed(self, target: S3BucketTarget) -> tuple[bool, str]:
+        """Evaluate the three independent gates for the active write probe.
+
+        Returns ``(allowed, reason)``. ``allowed`` is True only when every gate
+        passes; the reason explains the first failing gate for the log.
+        """
+        # Gate 1: explicit environment variable.
+        if not _env_allows_s3_write():
+            return False, f"env var {_ENV_ALLOW_S3_WRITE} is not set to a truthy value"
+        # Gate 2: the --s3-lab-write flag (true to even reach here; re-checked
+        # so this method is correct in isolation and defensible under review).
+        if not self._lab_write:
+            return False, "--s3-lab-write flag is off"
+        # Gate 3: the bucket must be inside an explicitly configured owned/lab
+        # bucket scope - never a plain, unconfigured bug-bounty target.
+        if self.scope is None or not self.scope.has_bucket_scope:
+            return False, "no owned/lab S3 bucket scope configured (--scope-bucket)"
+        if not self.scope.is_bucket_in_scope(target.bucket):
+            return False, "bucket is not inside the configured owned/lab scope"
+        return True, "all gates passed"
+
+    def _send_mutating(self, method: str, url: str, body: str | None = None):
+        """Issue a single PUT/DELETE through the shared, scope-enforced HTTP
+        engine. This is the ONLY method that sends a mutating request, and it
+        is called EXCLUSIVELY from ``_run_active_lab_write`` after every gate in
+        ``_lab_write_allowed`` has passed."""
+        if self.http is None:
+            return None
+        return self.http.request(method=method, url=url, headers={}, body=body)
+
+    def _active_lab_write_probe(self, base: str) -> _WriteProbeResult:
+        """Upload one tiny marker object, then delete it immediately.
+
+        The marker key is unmistakable (``wily-check-<random>.txt``) so the
+        object is obviously a scanner artifact. The DELETE runs in a
+        ``finally`` so a successful PUT is always cleaned up even if something
+        raises in between; a failed cleanup is reported, never swallowed.
+        """
+        marker_key = f"wily-check-{secrets.token_hex(8)}.txt"
+        obj_url = f"{base.rstrip('/')}/{marker_key}"
+        marker_body = "wily write-permission check - safe to delete"
+
+        put_status: int | None = None
+        confirmed = False
+        delete_status: int | None = None
+        delete_error: str | None = None
+        try:
+            put_resp = self._send_mutating("PUT", obj_url, body=marker_body)
+            if put_resp is not None:
+                put_status = put_resp.status_code
+                confirmed = 200 <= put_resp.status_code < 300
+        except Exception as exc:  # a failed PUT means nothing was created
+            logger.info("S3 lab-write PUT to %s failed: %s", obj_url, exc)
+        finally:
+            # Best-effort cleanup: always try to remove the marker so a
+            # successful PUT never leaves an artifact behind.
+            try:
+                del_resp = self._send_mutating("DELETE", obj_url)
+                if del_resp is not None:
+                    delete_status = del_resp.status_code
+            except Exception as exc:
+                delete_error = str(exc)
+                logger.warning(
+                    "S3 lab-write cleanup DELETE of %s failed: %s", obj_url, exc
+                )
+
+        cleanup_ok = delete_status is not None and 200 <= delete_status < 300
+        return _WriteProbeResult(
+            marker_key=marker_key,
+            put_status=put_status,
+            confirmed=confirmed,
+            delete_status=delete_status,
+            delete_error=delete_error,
+            cleanup_ok=cleanup_ok,
+        )
+
+    def _run_active_lab_write(self, bucket: str, base: str) -> list[Finding]:
+        """Run the gated marker PUT/DELETE and, only on a confirmed write,
+        emit an active-confirmation ``s3-bucket-public-writable`` finding whose
+        evidence is distinct from the read-only ACL inference."""
+        result = self._active_lab_write_probe(base)
+        if not result.confirmed:
+            # The marker PUT was rejected: the bucket is NOT publicly writable.
+            # Nothing was created, so the best-effort DELETE was a harmless
+            # no-op and there is nothing to report.
+            return []
+
+        cleanup_failed = not result.cleanup_ok
+        evidence: dict = {
+            "bucket": bucket,
+            "check": "write_permission_confirmed_active_lab_put",
+            "active_probe": True,
+            "marker_key": result.marker_key,
+            "put_status": result.put_status,
+            "delete_status": result.delete_status,
+            "cleanup_ok": result.cleanup_ok,
+            "note": (
+                "ACTIVE lab-mode confirmation: a single tiny marker object was "
+                "uploaded with PUT and then deleted. This is NOT the default "
+                "read-only ACL inference - it ran only because "
+                f"{_ENV_ALLOW_S3_WRITE}=true, the --s3-lab-write flag, and an "
+                "owned/lab bucket scope were ALL set, and the PUT returned a "
+                "success status."
+            ),
+        }
+        if cleanup_failed:
+            evidence["cleanup_failed"] = True
+            evidence["cleanup_error"] = result.delete_error
+            evidence["cleanup_warning"] = (
+                f"The marker object {result.marker_key} may still exist "
+                f"(DELETE status={result.delete_status}, "
+                f"error={result.delete_error}). Remove it manually."
+            )
+            logger.warning(
+                "S3 lab-write marker %s on %s may NOT have been deleted "
+                "(status=%s, error=%s).",
+                result.marker_key, bucket, result.delete_status, result.delete_error,
+            )
+
+        return [
+            Finding(
+                asset=f"s3://{bucket}",
+                category="s3-bucket-public-writable",
+                severity="critical",
+                confidence=0.95,
+                discovery_source="scanner",
+                evidence=evidence,
+                remediation=(
+                    "CONFIRMED writable by an anonymous principal (a marker "
+                    "object was uploaded and deleted). Anyone can upload, "
+                    "overwrite or delete objects (defacement / malware hosting "
+                    "/ data destruction). Remove the public WRITE grant / policy "
+                    "statement immediately and enable S3 Block Public Access."
+                    + (
+                        " NOTE: automated cleanup of the marker object FAILED - "
+                        "delete it manually."
+                        if cleanup_failed
+                        else ""
+                    )
+                ),
+            )
+        ]
 
     @staticmethod
     def _acl_grants_write(acl_body: str) -> list[str]:

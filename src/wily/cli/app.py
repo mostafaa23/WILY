@@ -89,6 +89,17 @@ def scan_command(
         None, "--identity",
         help="name=HeaderValue (e.g. tenant_a='Bearer xyz'). Repeat at least twice to enable BOLA.",
     ),
+    token_pool: str = typer.Option(
+        None, "--token-pool",
+        help=(
+            "Path to a file of saved test identities (one 'name=Header: value' "
+            "or 'name=<bare JWT>' per line). When fewer than two --identity "
+            "values are given, Wily checks which pooled tokens are still live "
+            "(read-only GET returning 200) and feeds the first two to BOLA. "
+            "Explicit --identity always wins; tokens are never printed. "
+            "Test/lab tokens only."
+        ),
+    ),
     iam_file: str = typer.Option(
         None, "--iam-file", help="Path to the output of: aws iam get-account-authorization-details - enables IAM checks."
     ),
@@ -138,6 +149,17 @@ def scan_command(
             "on, Wily only READS the bucket ACL/policy and infers writability "
             "from a public WRITE grant - it never sends a PUT/DELETE, so it "
             "cannot overwrite or delete objects on any target."
+        ),
+    ),
+    s3_lab_write: bool = typer.Option(
+        False, "--s3-lab-write/--no-s3-lab-write",
+        help=(
+            "OPTIONAL lab-mode ACTIVE write check. OFF by default and DANGEROUS "
+            "on real targets, so it is triple-gated: it sends a real PUT/DELETE "
+            "only when ALL of (1) env WILY_ALLOW_S3_WRITE=true, (2) this flag, "
+            "and (3) the bucket is inside an owned/lab --scope-bucket scope are "
+            "set. It uploads one tiny wily-check-<id>.txt marker, confirms it, "
+            "then deletes it immediately. Use only on buckets you own/control."
         ),
     ),
     use_rules: bool = typer.Option(
@@ -410,6 +432,7 @@ def scan_command(
                 output_dir=output_dir,
                 token=token,
                 identities_raw=identity or [],
+                token_pool=token_pool,
                 iam_file=iam_file,
                 allow_local=allow_local,
                 blind=blind,
@@ -419,6 +442,7 @@ def scan_command(
                 confirm_destructive=confirm_destructive,
                 confirm_owned_infra=confirm_owned_infra,
                 confirm_s3_writes=confirm_s3_writes,
+                s3_lab_write=s3_lab_write,
                 probe_live=probe_live,
                 cloud_enum=cloud_enum,
                 cloud_keywords=cloud_keyword or [],

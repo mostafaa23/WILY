@@ -65,6 +65,66 @@ def test_authorizer_fail_open_detected():
     assert fo.evidence["invalid_auth_status"] == 200
 
 
+def test_head_empty_body_200_is_not_a_leak():
+    """HEAD carries no body, so a 200 HEAD is not a data leak: only the GET
+    (which actually returns data) should be flagged, not HEAD as well."""
+
+    def responder(method, headers):
+        if method == "HEAD":
+            return _Resp(200, "")  # HEAD never has a body
+        return _Resp(200, '{"order_id":123,"customer":"secret-data"}')
+
+    target = AuthzBypassTarget(
+        url="https://example.com/orders/123",
+        include_destructive_methods=False,  # GET + HEAD
+        probe_authorizer_fail_open=False,
+    )
+    findings = [
+        f for f in _scanner(responder).run(target)
+        if f.category == "authz-bypass-missing-authorizer"
+    ]
+    assert len(findings) == 1
+    assert findings[0].evidence["method"] == "GET"
+
+
+def test_empty_body_200_read_is_not_flagged_at_all():
+    """Every read method answers 200 with an empty body -> nothing leaked."""
+
+    def responder(method, headers):
+        return _Resp(200, "   ")  # whitespace-only = empty
+
+    target = AuthzBypassTarget(
+        url="https://example.com/ping",
+        include_destructive_methods=False,
+        probe_authorizer_fail_open=False,
+    )
+    findings = _scanner(responder).run(target)
+    assert [f for f in findings if f.category == "authz-bypass-missing-authorizer"] == []
+
+
+def test_destructive_empty_body_200_still_flagged():
+    """A write method accepted unauthenticated (200) is a real finding even
+    with an empty body - the empty-body skip must not weaken write detection."""
+
+    def responder(method, headers):
+        if method in ("GET", "HEAD"):
+            return _Resp(401, '{"error":"unauthorized"}')  # reads protected
+        return _Resp(200, "")  # DELETE accepted, no body
+
+    target = AuthzBypassTarget(
+        url="https://example.com/orders/123",
+        include_destructive_methods=True,
+        destructive_methods=["DELETE"],
+        probe_authorizer_fail_open=False,
+    )
+    scanner = AuthzBypassScanner(
+        scope_manager=None, http_engine=_FakeHttp(responder), confirm_destructive=True
+    )
+    findings = scanner.run(target)
+    cats = [f.evidence.get("method") for f in findings if f.category == "authz-bypass-missing-authorizer"]
+    assert "DELETE" in cats
+
+
 def test_soft_200_denial_not_flagged():
     """A 200 whose body is an auth-error message is a soft denial, not a leak."""
 
