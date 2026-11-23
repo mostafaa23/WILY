@@ -1,7 +1,8 @@
 """Tests for the optional email-the-report notifier (wily.notify.email_report).
 
-No boto3 and no network: a fake Lambda client is injected, so these assert the
-packaging and the invoke event shape, not real AWS calls.
+No network and no AWS SDK: a fake http_post callable is injected, so these
+assert the packaging and the request event shape against the public
+send-report endpoint, not real HTTP calls.
 """
 
 import base64
@@ -12,23 +13,23 @@ import zipfile
 import pytest
 
 from wily.notify import (
+    DEFAULT_REPORT_ENDPOINT,
     ReportNotificationError,
     package_reports,
-    send_report_via_lambda,
+    send_report_via_http,
 )
 
 
-class _FakeLambda:
-    """Stand-in for a boto3 Lambda client."""
+def _fake_post(status=200, body=None):
+    """Build an injectable http_post that records its calls."""
+    calls: list[tuple] = []
+    text = json.dumps(body if body is not None else {"status": "sent", "message_id": "m-1"})
 
-    def __init__(self, payload: bytes = b'{"status": "sent"}', function_error=None):
-        self.calls: list[dict] = []
-        self._payload = payload
-        self._function_error = function_error
+    def http_post(url, json_body, timeout):
+        calls.append((url, json_body, timeout))
+        return status, text
 
-    def invoke(self, **kwargs):
-        self.calls.append(kwargs)
-        return {"Payload": io.BytesIO(self._payload), "FunctionError": self._function_error}
+    return http_post, calls
 
 
 # --------------------------------------------------------------- package_reports
@@ -67,71 +68,88 @@ def test_package_empty_directory_raises(tmp_path):
         package_reports(d)
 
 
-# ------------------------------------------------------------ send_report_via_lambda
+# ------------------------------------------------------------ send_report_via_http
 
 
-def test_send_builds_base64_event_and_invokes(tmp_path):
+def test_send_posts_base64_event_to_default_endpoint(tmp_path):
     report = tmp_path / "report.json"
     report.write_bytes(b'{"findings": [1, 2, 3]}')
-    fake = _FakeLambda()
+    http_post, calls = _fake_post()
 
-    result = send_report_via_lambda(
+    result = send_report_via_http(
         recipient="tester@example.com",
         report_path=report,
-        function_name="wily-send-report",
         subject="Wily scan report",
-        client=fake,
+        http_post=http_post,
     )
 
-    assert len(fake.calls) == 1
-    call = fake.calls[0]
-    assert call["FunctionName"] == "wily-send-report"
-    event = json.loads(call["Payload"].decode("utf-8"))
+    assert len(calls) == 1
+    url, event, timeout = calls[0]
+    assert url == DEFAULT_REPORT_ENDPOINT
     assert event["recipient"] == "tester@example.com"
     assert event["subject"] == "Wily scan report"
     assert event["report"]["encoding"] == "base64"
-    # The attachment round-trips back to the original bytes.
     assert base64.b64decode(event["report"]["content"]) == b'{"findings": [1, 2, 3]}'
-    assert result["function"] == "wily-send-report"
+    assert result["endpoint"] == DEFAULT_REPORT_ENDPOINT
     assert result["bytes"] == len(b'{"findings": [1, 2, 3]}')
+    assert result["message_id"] == "m-1"
 
 
-def test_send_requires_a_function_name(tmp_path, monkeypatch):
-    monkeypatch.delenv("WILY_REPORT_LAMBDA", raising=False)
+def test_send_uses_explicit_endpoint_over_default(tmp_path):
     report = tmp_path / "r.json"
     report.write_text("{}", encoding="utf-8")
-    with pytest.raises(ReportNotificationError, match="Lambda function"):
-        send_report_via_lambda(
-            recipient="a@b.com", report_path=report, client=_FakeLambda()
-        )
+    http_post, calls = _fake_post()
 
-
-def test_send_falls_back_to_env_function_name(tmp_path, monkeypatch):
-    monkeypatch.setenv("WILY_REPORT_LAMBDA", "env-fn")
-    report = tmp_path / "r.json"
-    report.write_text("{}", encoding="utf-8")
-    fake = _FakeLambda()
-    result = send_report_via_lambda(
-        recipient="a@b.com", report_path=report, client=fake
+    result = send_report_via_http(
+        recipient="a@b.com",
+        report_path=report,
+        endpoint="https://self-hosted.example.com/",
+        http_post=http_post,
     )
-    assert result["function"] == "env-fn"
-    assert fake.calls[0]["FunctionName"] == "env-fn"
+    assert calls[0][0] == "https://self-hosted.example.com/"
+    assert result["endpoint"] == "https://self-hosted.example.com/"
+
+
+def test_send_falls_back_to_env_endpoint(tmp_path, monkeypatch):
+    monkeypatch.setenv("WILY_REPORT_ENDPOINT", "https://env-endpoint.example.com/")
+    report = tmp_path / "r.json"
+    report.write_text("{}", encoding="utf-8")
+    http_post, calls = _fake_post()
+
+    send_report_via_http(recipient="a@b.com", report_path=report, http_post=http_post)
+    assert calls[0][0] == "https://env-endpoint.example.com/"
 
 
 def test_send_requires_a_recipient(tmp_path):
     report = tmp_path / "r.json"
     report.write_text("{}", encoding="utf-8")
+    http_post, _ = _fake_post()
     with pytest.raises(ReportNotificationError, match="recipient"):
-        send_report_via_lambda(
-            recipient="", report_path=report, function_name="fn", client=_FakeLambda()
-        )
+        send_report_via_http(recipient="", report_path=report, http_post=http_post)
 
 
-def test_send_surfaces_lambda_function_error(tmp_path):
+def test_send_raises_on_http_error_status(tmp_path):
     report = tmp_path / "r.json"
     report.write_text("{}", encoding="utf-8")
-    fake = _FakeLambda(payload=b'{"errorMessage": "boom"}', function_error="Unhandled")
-    with pytest.raises(ReportNotificationError, match="returned an error"):
-        send_report_via_lambda(
-            recipient="a@b.com", report_path=report, function_name="fn", client=fake
-        )
+    http_post, _ = _fake_post(status=500, body={"error": "boom"})
+    with pytest.raises(ReportNotificationError, match="HTTP 500"):
+        send_report_via_http(recipient="a@b.com", report_path=report, http_post=http_post)
+
+
+def test_send_raises_when_status_is_not_sent(tmp_path):
+    report = tmp_path / "r.json"
+    report.write_text("{}", encoding="utf-8")
+    http_post, _ = _fake_post(status=200, body={"status": "queued"})
+    with pytest.raises(ReportNotificationError, match="did not confirm"):
+        send_report_via_http(recipient="a@b.com", report_path=report, http_post=http_post)
+
+
+def test_send_wraps_network_errors(tmp_path):
+    report = tmp_path / "r.json"
+    report.write_text("{}", encoding="utf-8")
+
+    def failing_post(url, body, timeout):
+        raise ConnectionError("no route to host")
+
+    with pytest.raises(ReportNotificationError, match="could not reach"):
+        send_report_via_http(recipient="a@b.com", report_path=report, http_post=failing_post)

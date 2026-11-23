@@ -8,6 +8,7 @@ that NO address is hardcoded.
 
 import base64
 import importlib.util
+import json
 from email import message_from_string
 from pathlib import Path
 
@@ -164,3 +165,89 @@ def test_s3_event_fetches_object(monkeypatch):
     assert result["attachment"] == "report.html"
     # Recipient resolved from the S3 object metadata.
     assert fake_ses.calls[0]["Destinations"] == ["meta@test.local"]
+
+
+# ----------------------------------------------- Function URL / HTTP invocation
+
+
+def _function_url_event(payload: dict, *, base64_body: bool = False) -> dict:
+    """Shape a Lambda Function URL (API Gateway payload format 2.0) would
+    actually send: the real JSON payload arrives as a *string* in 'body',
+    alongside HTTP plumbing."""
+    body = json.dumps(payload)
+    if base64_body:
+        body = base64.b64encode(body.encode("utf-8")).decode("ascii")
+    return {
+        "version": "2.0",
+        "routeKey": "$default",
+        "rawPath": "/",
+        "headers": {"content-type": "application/json"},
+        "requestContext": {"http": {"method": "POST"}},
+        "body": body,
+        "isBase64Encoded": base64_body,
+    }
+
+
+def test_function_url_event_is_unwrapped_and_sends(handler_mod, monkeypatch):
+    monkeypatch.setenv("SES_SENDER_EMAIL", "sender@test.local")
+    event = _function_url_event(
+        {"recipient": "rcpt@test.local", "report": {"filename": "r.json", "content": "{}"}}
+    )
+    response = handler_mod.handler(event, None)
+    assert response["statusCode"] == 200
+    body = json.loads(response["body"])
+    assert body["status"] == "sent"
+    assert handler_mod._fake_ses.calls[0]["Destinations"] == ["rcpt@test.local"]
+
+
+def test_function_url_base64_body_is_decoded(handler_mod, monkeypatch):
+    monkeypatch.setenv("SES_SENDER_EMAIL", "sender@test.local")
+    event = _function_url_event(
+        {"recipient": "rcpt@test.local", "report": {"filename": "r.json", "content": "{}"}},
+        base64_body=True,
+    )
+    response = handler_mod.handler(event, None)
+    assert response["statusCode"] == 200
+
+
+def test_function_url_missing_recipient_returns_400_not_crash(handler_mod, monkeypatch):
+    monkeypatch.setenv("SES_SENDER_EMAIL", "sender@test.local")
+    monkeypatch.delenv("REPORT_RECIPIENT_EMAIL", raising=False)
+    event = _function_url_event({"report": {"filename": "r.json", "content": "{}"}})
+    response = handler_mod.handler(event, None)
+    assert response["statusCode"] == 400
+    body = json.loads(response["body"])
+    assert body["status"] == "error"
+    assert "recipient" in body["message"].lower()
+
+
+def test_function_url_ses_rejection_returns_400(handler_mod, monkeypatch):
+    monkeypatch.setenv("SES_SENDER_EMAIL", "sender@test.local")
+
+    def _rejecting_send_raw_email(**kwargs):
+        raise RuntimeError("Email address is not verified.")
+
+    handler_mod._fake_ses.send_raw_email = _rejecting_send_raw_email
+    event = _function_url_event(
+        {"recipient": "unverified@test.local", "report": {"filename": "r.json", "content": "{}"}}
+    )
+    response = handler_mod.handler(event, None)
+    assert response["statusCode"] == 400
+    body = json.loads(response["body"])
+    assert "not verified" in body["message"]
+
+
+def test_function_url_malformed_body_returns_400_not_crash(monkeypatch):
+    mod = _load_handler()
+    monkeypatch.setenv("SES_SENDER_EMAIL", "sender@test.local")
+    event = _function_url_event({})
+    event["body"] = "{not valid json"
+    response = mod.handler(event, None)
+    assert response["statusCode"] == 400
+
+
+def test_direct_invoke_shape_is_unaffected(handler_mod):
+    """A plain direct-invoke event (no requestContext/body) keeps raising on
+    failure instead of returning an HTTP-shaped response, same as before."""
+    with pytest.raises(handler_mod.ReportEmailError):
+        handler_mod.handler({"report": {"content": "{}"}}, None)  # no recipient, no env

@@ -41,7 +41,7 @@ from wily.cli.commands import (
     triage_cmd,
 )
 from wily.cli.gate import FailOn, evaluate_gate, format_gate_lines
-from wily.notify import ReportNotificationError, send_report_via_lambda
+from wily.notify import ReportNotificationError, send_report_via_http
 
 logger = logging.getLogger("wily.cli")
 
@@ -328,17 +328,17 @@ def scan_command(
         None, "--email",
         help=(
             "Email the finished report to this address when the scan ends "
-            "(handy for long scans). Delivered by invoking the deployed "
-            "send-report Lambda via SES - needs --report-lambda (or "
-            "$WILY_REPORT_LAMBDA) and the optional 'aws' extra "
-            "(pip install 'wily-scanner[aws]')."
+            "(handy for long scans). Sent via the project's hosted report "
+            "service - a plain HTTPS call, no AWS account or extra install "
+            "needed."
         ),
     ),
-    report_lambda: str = typer.Option(
-        None, "--report-lambda",
+    report_endpoint: str = typer.Option(
+        None, "--report-endpoint",
         help=(
-            "Name of the deployed send-report Lambda to invoke for --email. "
-            "Defaults to $WILY_REPORT_LAMBDA."
+            "Advanced: use a self-hosted send-report service instead of the "
+            "project's default one (see lambda/send_report/). Defaults to "
+            "$WILY_REPORT_ENDPOINT, then the built-in default."
         ),
     ),
 ) -> None:
@@ -437,15 +437,15 @@ def scan_command(
     if recipient:
         report_path = output_dir or output
         try:
-            info = send_report_via_lambda(
+            info = send_report_via_http(
                 recipient=recipient,
                 report_path=report_path,
-                function_name=report_lambda,
+                endpoint=report_endpoint,
                 subject="Wily scan report",
             )
             typer.echo(
                 f"[+] Report emailed to {recipient} (attachment "
-                f"{info['attachment']}, via Lambda {info['function']}).",
+                f"{info['attachment']}).",
                 err=True,
             )
         except ReportNotificationError as e:

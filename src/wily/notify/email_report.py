@@ -1,23 +1,19 @@
-"""Email a finished scan report by invoking the deployed AWS Lambda
-(``lambda/send_report``), which delivers it via Amazon SES.
+"""Email a finished scan report via the deployed Wily send-report service,
+which delivers it through Amazon SES.
 
 A full scan of many targets can take a while, so Wily can hand the final
 report off to be emailed when it finishes - "leave your address and we'll send
-it to you". The CLI does not talk to SES directly: it invokes the Lambda with
-the same direct-invoke event shape that handler already accepts, so the email
-address, sender and credentials all stay in the Lambda's own configuration and
-nothing sensitive is baked into the client.
+it to you". This is a plain HTTPS POST to a public Lambda Function URL: no AWS
+account, credentials, or extra dependency is needed by whoever runs `wily` -
+only internet access. The sender address, SES credentials and everything
+AWS-side live entirely in the deployed Lambda's own configuration; nothing
+sensitive is baked into the client, and the request carries only the
+recipient address the user typed and the report bytes.
 
-``boto3`` is imported lazily, so this module (and its tests) load without it;
-install the optional dependency with ``pip install "wily-scanner[aws]"`` to use
-the feature. Configuration:
-
-  --email ADDRESS / passed recipient   who receives the report (required)
-  --report-lambda NAME / WILY_REPORT_LAMBDA   the Lambda function to invoke
-  AWS_REGION                            region for the Lambda client (optional)
-
-Credentials come from the caller's normal AWS environment (profile, env vars,
-or instance role) - never from anything stored here.
+``DEFAULT_REPORT_ENDPOINT`` is the project's own hosted instance, so this
+works out of the box for anyone who installs wily-scanner. Point it elsewhere
+with ``--report-endpoint`` / ``$WILY_REPORT_ENDPOINT`` to use a self-hosted
+deployment instead (see ``lambda/send_report/``).
 """
 
 from __future__ import annotations
@@ -29,9 +25,15 @@ import os
 import zipfile
 from pathlib import Path
 
+import requests
+
+# The project's own publicly reachable send-report Lambda (Function URL, no
+# auth required - it only ever emails the recipient the caller supplies).
+DEFAULT_REPORT_ENDPOINT = "https://xyyawpfjebtsvqgmglxprtfkly0apbty.lambda-url.eu-north-1.on.aws/"
+
 
 class ReportNotificationError(RuntimeError):
-    """Raised when the report cannot be packaged or handed to the Lambda.
+    """Raised when the report cannot be packaged or handed off to be emailed.
 
     The CLI catches this and prints a clear message; a notification failure
     never changes the scan's own exit code.
@@ -41,14 +43,6 @@ class ReportNotificationError(RuntimeError):
 def _env(name: str, default: str | None = None) -> str | None:
     value = os.environ.get(name, default)
     return value.strip() if isinstance(value, str) else value
-
-
-def _lambda_client(region: str | None):
-    # Imported lazily so the module loads without boto3 and tests can patch
-    # this function to inject a fake client.
-    import boto3
-
-    return boto3.client("lambda", region_name=region) if region else boto3.client("lambda")
 
 
 def package_reports(path: str | Path) -> tuple[str, bytes]:
@@ -75,34 +69,7 @@ def package_reports(path: str | Path) -> tuple[str, bytes]:
     return path.name, path.read_bytes()
 
 
-def send_report_via_lambda(
-    *,
-    recipient: str,
-    report_path: str | Path,
-    function_name: str | None = None,
-    subject: str | None = None,
-    region: str | None = None,
-    client=None,
-) -> dict:
-    """Package the report and invoke the send-report Lambda to email it.
-
-    ``function_name`` falls back to ``WILY_REPORT_LAMBDA`` and ``region`` to
-    ``AWS_REGION``. ``client`` is injectable for testing. Returns a small
-    result dict; raises :class:`ReportNotificationError` on any misconfiguration
-    or Lambda-side error.
-    """
-    function_name = function_name or _env("WILY_REPORT_LAMBDA")
-    if not function_name:
-        raise ReportNotificationError(
-            "no Lambda function configured: pass --report-lambda NAME or set "
-            "WILY_REPORT_LAMBDA to the deployed send-report function."
-        )
-    if not recipient:
-        raise ReportNotificationError("no recipient email address was given.")
-
-    region = region or _env("AWS_REGION")
-    filename, content = package_reports(report_path)
-
+def _build_event(recipient: str, filename: str, content: bytes, subject: str | None) -> dict:
     event: dict = {
         "recipient": recipient,
         "report": {
@@ -113,40 +80,63 @@ def send_report_via_lambda(
     }
     if subject:
         event["subject"] = subject
+    return event
 
-    if client is None:
-        try:
-            client = _lambda_client(region)
-        except ImportError as exc:  # boto3 not installed
-            raise ReportNotificationError(
-                "boto3 is required to email reports; install it with "
-                '`pip install "wily-scanner[aws]"`.'
-            ) from exc
+
+def send_report_via_http(
+    *,
+    recipient: str,
+    report_path: str | Path,
+    endpoint: str | None = None,
+    subject: str | None = None,
+    timeout: float = 30.0,
+    http_post=None,
+) -> dict:
+    """Package the report and POST it to a send-report Function URL.
+
+    ``endpoint`` falls back to ``$WILY_REPORT_ENDPOINT``, then to the
+    project's own :data:`DEFAULT_REPORT_ENDPOINT` - so this works with no
+    configuration at all unless a self-hosted deployment is wanted.
+    ``http_post`` is injectable for testing: ``(url, json_body, timeout) ->
+    (status_code, response_text)``. Raises :class:`ReportNotificationError` on
+    any misconfiguration or server-side error.
+    """
+    if not recipient:
+        raise ReportNotificationError("no recipient email address was given.")
+
+    endpoint = endpoint or _env("WILY_REPORT_ENDPOINT") or DEFAULT_REPORT_ENDPOINT
+    filename, content = package_reports(report_path)
+    event = _build_event(recipient, filename, content, subject)
+
+    if http_post is None:
+
+        def http_post(url: str, body: dict, timeout: float) -> tuple[int, str]:
+            resp = requests.post(url, json=body, timeout=timeout)
+            return resp.status_code, resp.text
 
     try:
-        response = client.invoke(
-            FunctionName=function_name,
-            Payload=json.dumps(event).encode("utf-8"),
+        status, text = http_post(endpoint, event, timeout)
+    except Exception as exc:  # network error, timeout, DNS, ...
+        raise ReportNotificationError(f"could not reach {endpoint}: {exc}") from exc
+
+    if status >= 400:
+        raise ReportNotificationError(
+            f"report service returned HTTP {status}: {text[:500]}"
         )
-    except Exception as exc:  # network / auth / no-such-function
-        raise ReportNotificationError(
-            f"invoking Lambda '{function_name}' failed: {exc}"
-        ) from exc
 
-    raw = response.get("Payload")
-    body = raw.read() if hasattr(raw, "read") else (raw or b"")
-    if isinstance(body, str):
-        body = body.encode("utf-8")
-    detail = body.decode("utf-8", "replace")[:500]
+    try:
+        data = json.loads(text) if text else {}
+    except ValueError:
+        data = {}
 
-    if response.get("FunctionError"):
+    if data.get("status") != "sent":
         raise ReportNotificationError(
-            f"Lambda '{function_name}' returned an error: {detail}"
+            f"report service did not confirm delivery: {text[:500]}"
         )
 
     return {
-        "function": function_name,
+        "endpoint": endpoint,
         "attachment": filename,
         "bytes": len(content),
-        "lambda_response": detail,
+        "message_id": data.get("message_id"),
     }
