@@ -24,6 +24,7 @@ command is available directly in any terminal as `wily`:
 
 import asyncio
 import logging
+import sys
 
 import typer
 
@@ -40,6 +41,7 @@ from wily.cli.commands import (
     triage_cmd,
 )
 from wily.cli.gate import FailOn, evaluate_gate, format_gate_lines
+from wily.notify import ReportNotificationError, send_report_via_lambda
 
 logger = logging.getLogger("wily.cli")
 
@@ -322,6 +324,23 @@ def scan_command(
             "log to <domain>/scan.log instead."
         ),
     ),
+    email: str = typer.Option(
+        None, "--email",
+        help=(
+            "Email the finished report to this address when the scan ends "
+            "(handy for long scans). Delivered by invoking the deployed "
+            "send-report Lambda via SES - needs --report-lambda (or "
+            "$WILY_REPORT_LAMBDA) and the optional 'aws' extra "
+            "(pip install 'wily-scanner[aws]')."
+        ),
+    ),
+    report_lambda: str = typer.Option(
+        None, "--report-lambda",
+        help=(
+            "Name of the deployed send-report Lambda to invoke for --email. "
+            "Defaults to $WILY_REPORT_LAMBDA."
+        ),
+    ),
 ) -> None:
     """The full bundle, automatically (Discovery + Auth Bypass + CORS + SSRF)
     against one or more domains, enabling JWT/BOLA/IAM based on the inputs you
@@ -348,6 +367,24 @@ def scan_command(
             err=True,
         )
         raise typer.Exit(code=2)
+
+    # Optional "email me the report when it's done". Explicit --email wins; for
+    # a multi-target (potentially long) scan in an interactive terminal, offer
+    # it once instead of making the user wait and watch.
+    recipient = email
+    if not recipient and len(targets) > 1 and sys.stdin.isatty():
+        answer = typer.prompt(
+            "This scan may take a while. Enter an email to receive the report "
+            "when it finishes (or press Enter to skip)",
+            default="",
+            show_default=False,
+        ).strip()
+        recipient = answer or None
+    if recipient:
+        typer.echo(
+            f"[*] The report will be emailed to {recipient} when the scan finishes.",
+            err=True,
+        )
 
     try:
         results = asyncio.run(
@@ -393,6 +430,26 @@ def scan_command(
         # from "the gate found something".
         typer.echo(f"Scan failed: {e}", err=True)
         raise typer.Exit(code=2) from e
+
+    # Email the finished report, if asked. Best-effort: a delivery failure is
+    # reported but never changes the scan's own exit code (the reports are on
+    # disk regardless).
+    if recipient:
+        report_path = output_dir or output
+        try:
+            info = send_report_via_lambda(
+                recipient=recipient,
+                report_path=report_path,
+                function_name=report_lambda,
+                subject="Wily scan report",
+            )
+            typer.echo(
+                f"[+] Report emailed to {recipient} (attachment "
+                f"{info['attachment']}, via Lambda {info['function']}).",
+                err=True,
+            )
+        except ReportNotificationError as e:
+            typer.echo(f"[!] Could not email the report: {e}", err=True)
 
     # CI gate: fail the build if findings crossed the chosen severity. A no-op
     # when --fail-on is 'none' (the default), so existing behaviour is unchanged.
