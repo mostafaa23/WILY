@@ -20,7 +20,7 @@ _ASCII_LOGO = r"""
   ╚══╝╚══╝ ╚═╝╚══════╝╚═╝
 """
 
-TAGLINE = "Cloud-native, black-box API security scanner"
+TAGLINE = "Cloud-native"
 HOMEPAGE = "https://github.com/mostafaa23/wily"
 
 
@@ -36,5 +36,6 @@ def print_banner(quiet: bool = False) -> None:
         )
 
     _console_err.print(f"[bold cyan]{_ASCII_LOGO}[/bold cyan]")
+    _mark(f"Wily - {TAGLINE}")
     _mark(f"Version {__version__}")
     _mark(f"[dim]{HOMEPAGE}[/dim]\n")
