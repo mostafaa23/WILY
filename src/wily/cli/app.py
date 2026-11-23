@@ -182,8 +182,22 @@ def scan_command(
         ),
     ),
     cloud_enum_max: int = typer.Option(
-        300, "--cloud-enum-max",
-        help="Cap on generated candidate names probed per run (default 300).",
+        None, "--cloud-enum-max",
+        help=(
+            "Cap on generated candidate names probed per run. Default: 400 "
+            "per keyword (covers the full built-in two-part list), or 3000 "
+            "per keyword with --cloud-enum-combos."
+        ),
+    ),
+    cloud_enum_combos: bool = typer.Option(
+        False, "--cloud-enum-combos/--no-cloud-enum-combos",
+        help=(
+            "Also generate three-part names - keyword + mutation + environment, "
+            "e.g. acme-assets-dev, dev-acme-backup (lazys3-style). Probed after "
+            "the two-part names. Adds thousands of candidates, each checked on "
+            "AWS/Azure/GCP, so the scan gets much longer. OFF by default; "
+            "needs --cloud-enum."
+        ),
     ),
     output: str = typer.Option(
         "wily-report.json", "-o", "--output",
@@ -327,10 +341,10 @@ def scan_command(
     email: str = typer.Option(
         None, "--email",
         help=(
-            "Email the finished report to this address when the scan ends "
-            "(handy for long scans). Sent via the project's hosted report "
-            "service - a plain HTTPS call, no AWS account or extra install "
-            "needed."
+            "Email the finished report to this address when the scan ends. "
+            "Usually not needed: an interactive terminal already asks for an "
+            "address before the scan starts (press Enter to skip). Pass this "
+            "to skip that prompt in a script/CI, or to run non-interactively."
         ),
     ),
     report_endpoint: str = typer.Option(
@@ -368,11 +382,13 @@ def scan_command(
         )
         raise typer.Exit(code=2)
 
-    # Optional "email me the report when it's done". Explicit --email wins; for
-    # a multi-target (potentially long) scan in an interactive terminal, offer
-    # it once instead of making the user wait and watch.
+    # Optional "email me the report when it's done". Explicit --email wins
+    # (for scripts/CI, where nothing should block on stdin); otherwise, in an
+    # interactive terminal, ask once before the scan starts - it may take a
+    # while regardless of target count, and the user can just press Enter to
+    # skip and keep watching the terminal as usual.
     recipient = email
-    if not recipient and len(targets) > 1 and sys.stdin.isatty():
+    if not recipient and targets and _stdin_is_interactive():
         answer = typer.prompt(
             "This scan may take a while. Enter an email to receive the report "
             "when it finishes (or press Enter to skip)",
@@ -408,6 +424,7 @@ def scan_command(
                 cloud_keywords=cloud_keyword or [],
                 cloud_enum_wordlist=cloud_enum_wordlist,
                 cloud_enum_max=cloud_enum_max,
+                cloud_enum_combos=cloud_enum_combos,
                 show_leak=show_leak,
                 burp_xml=burp_xml,
                 import_har=import_har,
@@ -467,6 +484,15 @@ app.command("ssrf", help="IMDS Cloud SSRF checks only.")(ssrf_cmd.run)
 app.command("discover", help="Discover real endpoints (OpenAPI/JS/wordlist) only, with no scanning.")(discover_cmd.run)
 app.command("triage", help="Record --valid/--fp analyst decisions against a prior scan report (feedback loop).")(triage_cmd.run)
 app.add_typer(templates_cmd.app, name="templates")
+
+
+def _stdin_is_interactive() -> bool:
+    """Whether stdin is a real terminal (not piped/redirected/CI). Kept as its
+    own function - rather than inlining ``sys.stdin.isatty()`` - because
+    Click's CliRunner swaps ``sys.stdin`` out for the duration of
+    ``invoke()``, so tests patch this function directly instead of fighting
+    that swap."""
+    return sys.stdin.isatty()
 
 
 def _version_callback(value: bool) -> None:
