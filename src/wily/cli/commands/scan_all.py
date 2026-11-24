@@ -53,6 +53,7 @@ from wily.recon.parameter_discovery import (
     discover_parameters,
     select_ssrf_candidates,
 )
+from wily.recon.subdomain_enum import enumerate_subdomains
 from wily.recon.token_harvest import harvest_tokens, redact_jwt
 from wily.recon.token_pool import load_token_pool, select_live_identities
 from wily.recon.traffic_import import ImportedTraffic, import_traffic
@@ -376,12 +377,66 @@ def sanitize_domain_filename(domain: str) -> str:
     return name or "target"
 
 
+def _enumerate_and_merge(
+    targets: list[str],
+    *,
+    output_dir: str | None,
+    output: str,
+    max_results: int | None,
+    binary: str | None,
+) -> list[str]:
+    """Expand each root target into its subfinder-discovered subdomains, save the
+    full target list to ``<out_dir>/subdomains.txt`` (so a later run can reuse it
+    with ``--targets-file``), and return roots + new subdomains in order.
+
+    Degrades gracefully: if subfinder is missing or errors on a target, that root
+    is kept and scanning proceeds. De-duplicates case-insensitively against the
+    roots and across targets."""
+    status = Console(stderr=True)
+    roots = list(targets)
+    seen = {t.strip().lower() for t in roots}
+    discovered: list[str] = []
+
+    for root in roots:
+        status.print(
+            f"[cyan][*][/cyan] Enumerating subdomains of [bold]{root}[/bold] "
+            "with subfinder (passive)..."
+        )
+        res = enumerate_subdomains(root, max_results=max_results, binary=binary)
+        if not res.tool_available:
+            status.print(f"[yellow][!][/yellow] {res.error}")
+            continue
+        if res.error:
+            status.print(f"[yellow][!][/yellow] subfinder ({root}): {res.error}")
+        new = [s for s in res.subdomains if s not in seen]
+        seen.update(new)
+        discovered.extend(new)
+        status.print(
+            f"[green][+][/green] {len(res.subdomains)} subdomain(s) found for "
+            f"{root} ({len(new)} new)."
+        )
+
+    merged = roots + discovered
+    out_dir = Path(output_dir) if output_dir else Path(output).resolve().parent
+    out_dir.mkdir(parents=True, exist_ok=True)
+    subs_file = out_dir / "subdomains.txt"
+    subs_file.write_text("\n".join(merged) + "\n", encoding="utf-8")
+    status.print(
+        f"[cyan][*][/cyan] {len(merged)} total target(s) "
+        f"({len(discovered)} discovered) saved to [bold]{subs_file}[/bold]."
+    )
+    return merged
+
+
 async def run_scans(
     *,
     targets: list[str],
     output: str,
     output_dir: str | None = None,
     verbose: bool = False,
+    enum_subdomains: bool = False,
+    subdomain_max: int | None = None,
+    subfinder_path: str | None = None,
     **scan_kwargs,
 ) -> dict[str, list]:
     """CLI-facing orchestrator: scan one or more domains, one report per domain.
@@ -401,6 +456,17 @@ async def run_scans(
         its own scope root, because every ``run_full_scan`` call builds a fresh
         ScopeManager, so findings never bleed across domains.
     """
+    # Optional passive subdomain expansion: turn each root into its live
+    # subdomains (subfinder) before scanning, and persist the full target list.
+    if enum_subdomains and targets:
+        targets = _enumerate_and_merge(
+            targets,
+            output_dir=output_dir,
+            output=output,
+            max_results=subdomain_max,
+            binary=subfinder_path,
+        )
+
     # No domain at all (IAM/Burp/HAR-only): preserve the legacy single-call path.
     if not targets:
         findings = await run_full_scan(domain=None, output=output, **scan_kwargs)

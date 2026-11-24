@@ -223,6 +223,27 @@ def scan_command(
             "needs --cloud-enum."
         ),
     ),
+    subdomains: bool = typer.Option(
+        False, "--subdomains/--no-subdomains",
+        help=(
+            "Before scanning, enumerate each target's subdomains with subfinder "
+            "(ProjectDiscovery, passive sources only - no brute force) and scan "
+            "them too. The full target list is saved to <output-dir>/subdomains.txt "
+            "so a later run can reuse it with --targets-file. Requires --output-dir "
+            "and the subfinder binary on PATH. OFF by default."
+        ),
+    ),
+    subdomain_max: int = typer.Option(
+        None, "--subdomain-max",
+        help=(
+            "Cap on subdomains kept per target from subfinder (e.g. 50). "
+            "Default: no cap (keep all discovered)."
+        ),
+    ),
+    subfinder_path: str = typer.Option(
+        None, "--subfinder-path",
+        help="Path to the subfinder binary if it is not on PATH.",
+    ),
     output: str = typer.Option(
         "wily-report.json", "-o", "--output",
         help=(
@@ -406,6 +427,15 @@ def scan_command(
         )
         raise typer.Exit(code=2)
 
+    if subdomains and not output_dir:
+        typer.echo(
+            "--subdomains expands each target into many subdomains, so a single "
+            "-o file would be overwritten. Pass --output-dir DIR to hold one "
+            "folder per discovered host (and the saved subdomains.txt).",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+
     # Optional "email me the report when it's done". Explicit --email wins
     # (for scripts/CI, where nothing should block on stdin); otherwise, in an
     # interactive terminal, ask once before the scan starts - it may take a
@@ -432,6 +462,9 @@ def scan_command(
                 targets=targets,
                 output=output,
                 output_dir=output_dir,
+                enum_subdomains=subdomains,
+                subdomain_max=subdomain_max,
+                subfinder_path=subfinder_path,
                 token=token,
                 identities_raw=identity or [],
                 token_pool=token_pool,
