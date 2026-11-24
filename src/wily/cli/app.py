@@ -224,13 +224,16 @@ def scan_command(
         ),
     ),
     subdomains: bool = typer.Option(
-        False, "--subdomains/--no-subdomains",
+        True, "--subdomains/--no-subdomains",
         help=(
-            "Before scanning, enumerate each target's subdomains with subfinder "
+            "Automatically enumerate each target's subdomains with subfinder "
             "(ProjectDiscovery, passive sources only - no brute force) and scan "
-            "them too. The full target list is saved to <output-dir>/subdomains.txt "
-            "so a later run can reuse it with --targets-file. Requires --output-dir "
-            "and the subfinder binary on PATH. OFF by default."
+            "them too, so `wily scan example.com` also covers api./dev./... When "
+            "subdomains are found and no --output-dir is given, one is created "
+            "automatically (<domain>-reports/) with a saved subdomains.txt you can "
+            "reuse via --targets-file. Needs the subfinder binary on PATH; if it is "
+            "missing, this step is skipped and only the given host(s) are scanned. "
+            "ON by default - use --no-subdomains to scan only the exact host(s)."
         ),
     ),
     subdomain_max: int = typer.Option(
@@ -423,15 +426,6 @@ def scan_command(
             f"{len(targets)} targets given but no --output-dir. A single -o would "
             "overwrite one report per domain; pass --output-dir DIR to write one "
             "<domain>.json per target.",
-            err=True,
-        )
-        raise typer.Exit(code=2)
-
-    if subdomains and not output_dir:
-        typer.echo(
-            "--subdomains expands each target into many subdomains, so a single "
-            "-o file would be overwritten. Pass --output-dir DIR to hold one "
-            "folder per discovered host (and the saved subdomains.txt).",
             err=True,
         )
         raise typer.Exit(code=2)

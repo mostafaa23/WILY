@@ -377,34 +377,47 @@ def sanitize_domain_filename(domain: str) -> str:
     return name or "target"
 
 
+def _default_subdomain_output_dir(root: str) -> str:
+    """Folder name to hold per-host reports when subdomains were discovered but
+    no ``--output-dir`` was given (many hosts cannot share one ``-o`` file)."""
+    return f"{sanitize_domain_filename(root)}-reports"
+
+
 def _enumerate_and_merge(
     targets: list[str],
     *,
     output_dir: str | None,
-    output: str,
     max_results: int | None,
     binary: str | None,
-) -> list[str]:
-    """Expand each root target into its subfinder-discovered subdomains, save the
-    full target list to ``<out_dir>/subdomains.txt`` (so a later run can reuse it
-    with ``--targets-file``), and return roots + new subdomains in order.
+) -> tuple[list[str], str | None]:
+    """Automatically expand each root target into its subfinder-discovered
+    subdomains, so ``wily scan example.com`` also reaches ``api.``/``dev.``/...
 
-    Degrades gracefully: if subfinder is missing or errors on a target, that root
-    is kept and scanning proceeds. De-duplicates case-insensitively against the
-    roots and across targets."""
+    Returns ``(targets, output_dir)``:
+
+    * When subdomains are found, the result holds roots + new subdomains, the
+      full list is saved to ``<out_dir>/subdomains.txt`` (reusable via
+      ``--targets-file``), and ``out_dir`` is the given ``--output-dir`` or one
+      derived from the first root when none was given.
+    * When subfinder is missing or finds nothing, the roots and the original
+      ``output_dir`` are returned unchanged - a plain single-host scan behaves
+      exactly as before, so this is safe to run by default.
+
+    Passive and read-only; de-duplicates case-insensitively."""
     status = Console(stderr=True)
     roots = list(targets)
     seen = {t.strip().lower() for t in roots}
     discovered: list[str] = []
+    warned_missing = False
 
     for root in roots:
-        status.print(
-            f"[cyan][*][/cyan] Enumerating subdomains of [bold]{root}[/bold] "
-            "with subfinder (passive)..."
-        )
         res = enumerate_subdomains(root, max_results=max_results, binary=binary)
         if not res.tool_available:
-            status.print(f"[yellow][!][/yellow] {res.error}")
+            # subfinder not installed: note it once, quietly, and scan the given
+            # host(s) only - never turn a routine scan into an error.
+            if not warned_missing:
+                status.print(f"[dim][*] {res.error}[/dim]")
+                warned_missing = True
             continue
         if res.error:
             status.print(f"[yellow][!][/yellow] subfinder ({root}): {res.error}")
@@ -412,20 +425,28 @@ def _enumerate_and_merge(
         seen.update(new)
         discovered.extend(new)
         status.print(
-            f"[green][+][/green] {len(res.subdomains)} subdomain(s) found for "
-            f"{root} ({len(new)} new)."
+            f"[green][+][/green] {root}: {len(res.subdomains)} subdomain(s) found "
+            f"({len(new)} new)."
         )
 
+    if not discovered:
+        return roots, output_dir
+
     merged = roots + discovered
-    out_dir = Path(output_dir) if output_dir else Path(output).resolve().parent
-    out_dir.mkdir(parents=True, exist_ok=True)
-    subs_file = out_dir / "subdomains.txt"
-    subs_file.write_text("\n".join(merged) + "\n", encoding="utf-8")
+    out_dir = output_dir or _default_subdomain_output_dir(roots[0])
+    path = Path(out_dir)
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "subdomains.txt").write_text("\n".join(merged) + "\n", encoding="utf-8")
+    if not output_dir:
+        status.print(
+            "[cyan][*][/cyan] No --output-dir given; writing one report folder per "
+            f"host to [bold]{out_dir}[/bold]."
+        )
     status.print(
         f"[cyan][*][/cyan] {len(merged)} total target(s) "
-        f"({len(discovered)} discovered) saved to [bold]{subs_file}[/bold]."
+        f"({len(discovered)} discovered) saved to [bold]{path / 'subdomains.txt'}[/bold]."
     )
-    return merged
+    return merged, out_dir
 
 
 async def run_scans(
@@ -459,10 +480,9 @@ async def run_scans(
     # Optional passive subdomain expansion: turn each root into its live
     # subdomains (subfinder) before scanning, and persist the full target list.
     if enum_subdomains and targets:
-        targets = _enumerate_and_merge(
+        targets, output_dir = _enumerate_and_merge(
             targets,
             output_dir=output_dir,
-            output=output,
             max_results=subdomain_max,
             binary=subfinder_path,
         )

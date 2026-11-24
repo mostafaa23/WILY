@@ -116,17 +116,33 @@ def test_enumerate_and_merge_writes_file_and_dedupes(tmp_path, monkeypatch):
 
     monkeypatch.setattr(scan_all, "enumerate_subdomains", fake_enum)
 
-    merged = scan_all._enumerate_and_merge(
+    merged, out_dir = scan_all._enumerate_and_merge(
         ["example.com", "api.example.com"],   # api.* also returned by enum -> no dup
         output_dir=str(tmp_path),
-        output="wily-report.json",
         max_results=None,
         binary=None,
     )
 
     assert merged == ["example.com", "api.example.com", "dev.example.com"]
+    assert out_dir == str(tmp_path)
     saved = (tmp_path / "subdomains.txt").read_text(encoding="utf-8").split()
     assert saved == ["example.com", "api.example.com", "dev.example.com"]
+
+
+def test_enumerate_and_merge_auto_derives_output_dir(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    def fake_enum(target, *, max_results=None, binary=None):
+        return SubdomainResult(root=target, subdomains=["api.example.com"])
+
+    monkeypatch.setattr(scan_all, "enumerate_subdomains", fake_enum)
+    merged, out_dir = scan_all._enumerate_and_merge(
+        ["example.com"], output_dir=None, max_results=None, binary=None
+    )
+    # many hosts can't share a single -o file, so a folder is created from the root
+    assert merged == ["example.com", "api.example.com"]
+    assert out_dir == "example.com-reports"
+    assert (tmp_path / "example.com-reports" / "subdomains.txt").exists()
 
 
 def test_enumerate_and_merge_survives_missing_tool(tmp_path, monkeypatch):
@@ -136,25 +152,25 @@ def test_enumerate_and_merge_survives_missing_tool(tmp_path, monkeypatch):
         )
 
     monkeypatch.setattr(scan_all, "enumerate_subdomains", fake_enum)
-    merged = scan_all._enumerate_and_merge(
+    merged, out_dir = scan_all._enumerate_and_merge(
         ["example.com"],
         output_dir=str(tmp_path),
-        output="wily-report.json",
         max_results=None,
         binary=None,
     )
-    # the root is still scanned even when enumeration could not run
+    # nothing discovered -> roots and output_dir unchanged, no file forced
     assert merged == ["example.com"]
-    assert (tmp_path / "subdomains.txt").exists()
+    assert out_dir == str(tmp_path)
+    assert not (tmp_path / "subdomains.txt").exists()
 
 
 @pytest.mark.asyncio
 async def test_run_scans_triggers_enumeration(tmp_path, monkeypatch):
     calls = {}
 
-    def fake_merge(targets, *, output_dir, output, max_results, binary):
+    def fake_merge(targets, *, output_dir, max_results, binary):
         calls["targets"] = targets
-        return ["example.com", "api.example.com"]
+        return ["example.com", "api.example.com"], str(tmp_path)
 
     async def fake_full_scan(domain, output, **kwargs):
         return []
@@ -166,7 +182,7 @@ async def test_run_scans_triggers_enumeration(tmp_path, monkeypatch):
     results = await scan_all.run_scans(
         targets=["example.com"],
         output="wily-report.json",
-        output_dir=str(tmp_path),
+        output_dir=None,
         enum_subdomains=True,
         subdomain_max=50,
     )
