@@ -164,9 +164,11 @@ def _dump_collected(artifacts_dir: Path, report, findings: list) -> None:
     for f in findings:
         by_sev[f.severity] = by_sev.get(f.severity, 0) + 1
         by_cat[f.category] = by_cat.get(f.category, 0) + 1
+    access = (disc.get("stats") or {}).get("access") if isinstance(disc, dict) else None
     (coll / "summary.json").write_text(
         json.dumps(
             {
+                "access": access,
                 "endpoints_discovered": len(endpoints),
                 "findings": len(findings),
                 "by_severity": by_sev,
@@ -656,7 +658,14 @@ async def run_full_scan(
         report = await ApiDiscoveryPipeline(disc_config).run()
         payload = report.to_json()
         endpoints = list(payload.get("endpoints", []))
-        console.print(f"[cyan][*][/cyan] {len(endpoints)} endpoint(s) discovered.")
+        access = (payload.get("stats") or {}).get("access") or {}
+        if access.get("state") in ("auth_wall", "dead"):
+            console.print(
+                f"[yellow][!][/yellow] {access.get('reason', access['state'])} "
+                f"- 0 endpoints (skipped deep fuzz)."
+            )
+        else:
+            console.print(f"[cyan][*][/cyan] {len(endpoints)} endpoint(s) discovered.")
 
     # Merge in imported endpoints that fall inside the authorized scope. They
     # are added to the same per-endpoint queue the scanners loop over below

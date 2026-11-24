@@ -211,6 +211,55 @@ LIVE_STATUSES = frozenset(
     {301, 302, 303, 307, 308, 401, 403, 405}  # 2xx handled by range check
 )
 
+_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+
+# Target access posture, decided by _calibrate_access before the fuzz sweep.
+ACCESS_OPEN = "open"            # normal target - fuzz as usual
+ACCESS_AUTH_WALL = "auth_wall"  # every path redirects to a login gate / 401-403
+ACCESS_DEAD = "dead"            # host unreachable - every probe failed
+ACCESS_CATCH_ALL = "catch_all"  # every path answers the same 2xx (soft-404 wall)
+
+# Well-known identity-provider hosts, used ONLY to print a friendlier name on
+# an auth wall. Detection never depends on this list - the general signal is
+# "every random path redirects off-scope"; this just prettifies the message.
+_AUTH_PROVIDER_HOSTS: tuple[tuple[str, str], ...] = (
+    ("login.microsoftonline.com", "Microsoft Entra ID"),
+    ("login.windows.net", "Microsoft Entra ID"),
+    ("sts.windows.net", "Microsoft Entra ID"),
+    ("accounts.google.com", "Google"),
+    ("okta.com", "Okta"),
+    ("auth0.com", "Auth0"),
+    ("onelogin.com", "OneLogin"),
+    ("pingidentity.com", "Ping Identity"),
+)
+
+# Only this many discovery errors are serialized into the JSON report - a
+# nothing/auth-wall scan can otherwise generate thousands of near-identical
+# scope-guard refusals (seen: a 2.6-4.6 MB discovery.json). The full live log
+# still goes to scan.log.
+_MAX_ERRORS_SERIALIZED = 200
+
+
+def _capped_errors(errors: list[str]) -> list[str]:
+    """Serialize at most _MAX_ERRORS_SERIALIZED errors, with a tail note when
+    truncated - keeps the JSON report from ballooning to megabytes of near-
+    identical scope-guard refusals on an auth-wall / dead target."""
+    if len(errors) <= _MAX_ERRORS_SERIALIZED:
+        return list(errors)
+    hidden = len(errors) - _MAX_ERRORS_SERIALIZED
+    return [*errors[:_MAX_ERRORS_SERIALIZED], f"... ({hidden} more errors truncated)"]
+
+
+def _auth_provider_name(host: str | None) -> str | None:
+    """Friendly provider name for a known login host, else None."""
+    if not host:
+        return None
+    h = host.lower()
+    for needle, name in _AUTH_PROVIDER_HOSTS:
+        if h == needle or h.endswith("." + needle):
+            return name
+    return None
+
 # Generic HTTP verbs that sometimes appear as quoted strings in JS bundles.
 _HTTP_VERBS = frozenset(
     {"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "TRACE", "CONNECT"}
@@ -572,6 +621,9 @@ class _Probe:
     status: int
     length: int | None
     content_type: str | None
+    # For a 3xx response: the hostname the Location header points at. Lets the
+    # fuzzer tell a real in-scope redirect from an off-scope auth/login gate.
+    redirect_host: str | None = None
 
 
 @dataclass
@@ -683,7 +735,7 @@ class DiscoveryReport:
                 }
                 for url, record in sorted(self.endpoints.items())
             },
-            "errors": self.errors,
+            "errors": _capped_errors(self.errors),
         }
 
 
@@ -917,10 +969,16 @@ class ApiDiscoveryPipeline:
             resp = await self._request(url, method="GET", follow=False)
             if resp is None:
                 return None
+        redirect_host: str | None = None
+        if resp.status in (301, 302, 303, 307, 308):
+            location = resp.headers.get("Location")
+            if location:
+                redirect_host = urlparse(urljoin(resp.url, location)).hostname
         return _Probe(
             status=resp.status,
             length=_to_int(resp.headers.get("Content-Length")),
             content_type=resp.headers.get("Content-Type"),
+            redirect_host=redirect_host,
         )
 
     # -- stage 0: user-provided spec ----------------------------------------
@@ -1347,6 +1405,74 @@ class ApiDiscoveryPipeline:
 
     # -- stage 3: smart fuzzing -----------------------------------------------
 
+    def _redirect_is_offscope(self, probe: _Probe | None) -> bool:
+        """True when ``probe`` is a 3xx whose Location points at a host OUTSIDE
+        the authorized scope - i.e. an SSO/login gate answering for this path,
+        not a real in-scope endpoint. With no scope manager we cannot judge, so
+        the answer is False (keep the old, permissive behavior)."""
+        if probe is None or probe.status not in _REDIRECT_STATUSES or not probe.redirect_host:
+            return False
+        if self.scope_manager is None:
+            return False
+        return not self.scope_manager.is_in_scope(f"https://{probe.redirect_host}/")
+
+    async def _calibrate_access(self) -> dict[str, Any]:
+        """Characterize the target's NEGATIVE response before the fuzz sweep -
+        the wildcard / auto-calibration step ffuf and feroxbuster use.
+
+        Probes a few certainly-absent random paths and classifies the target:
+          * ``dead`` - nothing answers (unreachable / all timeouts).
+          * ``auth_wall`` - every path redirects off-scope to a login gate, or
+            every path returns 401/403. There are no publicly discoverable
+            endpoints; each 3xx is the gate, not a route. (This is exactly the
+            case that otherwise reports thousands of fake endpoints.)
+          * ``catch_all`` - every path answers the same 2xx body (soft-404 SPA).
+          * ``open`` - genuine 404s / mixed responses: a normal target.
+
+        Returns a profile dict; ``soft_signature`` (for ``catch_all``) is kept
+        out of the report-facing copy.
+        """
+        samples = [
+            await self._probe(f"{self.origin}/wily-{secrets.token_hex(6)}")
+            for _ in range(3)
+        ]
+        live = [p for p in samples if p is not None]
+
+        if not live:
+            return {"state": ACCESS_DEAD, "reason": "host unreachable - every probe failed"}
+
+        if all(self._redirect_is_offscope(p) for p in live):
+            host = live[0].redirect_host
+            provider = _auth_provider_name(host)
+            reason = (
+                f"requires authentication ({provider})"
+                if provider
+                else f"requires authentication - redirects off-site to {host}"
+            )
+            return {"state": ACCESS_AUTH_WALL, "reason": reason, "auth_host": host}
+
+        if all(p.status in (401, 403) for p in live):
+            return {
+                "state": ACCESS_AUTH_WALL,
+                "reason": f"requires authentication - every path returns {live[0].status}",
+            }
+
+        if all(200 <= p.status < 300 for p in live):
+            lengths = [p.length for p in live if p.length is not None]
+            if (
+                len({p.status for p in live}) == 1
+                and len(lengths) == len(live)
+                and max(lengths) - min(lengths) <= 32
+            ):
+                p0 = live[0]
+                return {
+                    "state": ACCESS_CATCH_ALL,
+                    "reason": "every path returns the same 2xx body (soft-404 wall)",
+                    "soft_signature": (p0.status, p0.length, (p0.content_type or "").split(";")[0]),
+                }
+
+        return {"state": ACCESS_OPEN, "reason": "normal target"}
+
     async def _stage_fuzz(self, report: DiscoveryReport) -> None:
         """Probe a route wordlist, filtering soft-404s via a baseline.
 
@@ -1372,12 +1498,21 @@ class ApiDiscoveryPipeline:
             ", deep fuzz / SecLists" if self.cfg.deep_fuzz and len(wordlist) > len(FUZZ_ROUTES) else "",
         )
 
-        # Baseline: a random, certainly-absent path reveals how this server
-        # answers "unknown" requests (soft-404 pages, blanket WAF blocks...).
-        baseline = await self._probe(f"{self.origin}/wily-{secrets.token_hex(4)}")
-        soft_signature: tuple[int, int, str] | None = None
-        if baseline is not None and baseline.length is not None:
-            soft_signature = (baseline.status, baseline.length, (baseline.content_type or "").split(";")[0])
+        # Negative-response calibration BEFORE the sweep: decide whether this
+        # target is an auth wall / dead / catch-all, so we don't count the
+        # login gate as thousands of endpoints or grind a wordlist for nothing.
+        access = await self._calibrate_access()
+        report.stats["access"] = {k: v for k, v in access.items() if k != "soft_signature"}
+        if access["state"] in (ACCESS_AUTH_WALL, ACCESS_DEAD):
+            logger.info(
+                "Access calibration: %s - skipping the %d-route fuzz sweep "
+                "(0 endpoints; every path is the gate, not a route)",
+                access["reason"],
+                len(wordlist),
+            )
+            return
+
+        soft_signature: tuple[int, int | None, str] | None = access.get("soft_signature")
 
         targets: list[str] = []
         queued_keys: set[str] = set()
@@ -1392,6 +1527,11 @@ class ApiDiscoveryPipeline:
             try:
                 probe = await self._probe(key_url)
                 if probe is None or not _status_is_live(probe.status):
+                    return
+                # A redirect to an OFF-SCOPE host (an SSO/login gate) is the
+                # auth wall answering for this path, never a real endpoint here.
+                if self._redirect_is_offscope(probe):
+                    logger.debug("Off-scope redirect (auth gate), not an endpoint: %s", key_url)
                     return
                 # Soft-404 / blanket-response filter: same status, near-same
                 # body size and same content type as the "nothing here" baseline.
