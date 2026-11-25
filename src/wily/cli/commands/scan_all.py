@@ -18,6 +18,7 @@ import json
 import logging
 import re
 import secrets
+import time
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -105,6 +106,29 @@ from wily.templates.loader import load_rules
 console = Console(stderr=True)
 
 _SEVERITY_RANK = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
+
+# --- Performance / budget defaults -------------------------------------------
+# These bound an otherwise-unbounded run so one large or slow target can no
+# longer grind for hours and starve the rest. None of them weaken detection on
+# a target that finishes inside its budget: they only cap worst-case time.
+#
+# How many endpoints of a SINGLE target are scanned at once. The scanners'
+# blocking requests are offloaded to threads (scanners.base.run_scanner), so
+# this many endpoints' checks genuinely overlap instead of running strictly one
+# after another. All requests still go through the one shared, scope-enforcing
+# HttpEngine and the per-host AdaptiveRateLimiter, so same-host traffic stays
+# rate-limited; the speedup comes from overlapping the idle network wait.
+_DEFAULT_ENDPOINT_CONCURRENCY = 8
+# How many independent TARGETS (hosts) are scanned at once. Different hosts have
+# their own ScopeManager / rate limiter / HttpEngine (a fresh set per
+# run_full_scan call), so this is safe parallelism across hosts, which is where
+# most of the real speedup on a big subdomain sweep comes from.
+_DEFAULT_TARGET_CONCURRENCY = 3
+# Per-target wall-clock budget (seconds). When a target's per-endpoint scan
+# passes this, the remaining endpoints are skipped, whatever was already found
+# is still written, and the run moves on - it never hangs on one host. 0 / None
+# disables the budget (fully unbounded, pre-performance-work behaviour).
+_DEFAULT_TARGET_TIMEOUT = 1200.0  # 20 minutes
 
 
 @contextlib.contextmanager
@@ -458,6 +482,9 @@ async def run_scans(
     enum_subdomains: bool = False,
     subdomain_max: int | None = None,
     subfinder_path: str | None = None,
+    concurrency: int = _DEFAULT_TARGET_CONCURRENCY,
+    target_timeout: float | None = _DEFAULT_TARGET_TIMEOUT,
+    max_duration: float | None = None,
     **scan_kwargs,
 ) -> dict[str, list]:
     """CLI-facing orchestrator: scan one or more domains, one report per domain.
@@ -466,15 +493,29 @@ async def run_scans(
     caller can apply a CI gate (``--fail-on``) over the same findings the
     reports contain.
 
+    Performance budgets (all bound worst-case time without weakening detection
+    on a target that finishes inside its budget):
+      * ``concurrency`` independent targets are scanned at once. Different hosts
+        each get their own ScopeManager / rate limiter / HttpEngine (a fresh set
+        per ``run_full_scan``), so this is safe cross-host parallelism - the main
+        win on a large subdomain sweep. Defaults to
+        ``_DEFAULT_TARGET_CONCURRENCY``.
+      * ``target_timeout`` is forwarded to each ``run_full_scan`` as its
+        per-target wall-clock budget: a host that exceeds it stops scanning
+        further endpoints, writes what it found, and the run moves on.
+      * ``max_duration`` caps the whole run: once the elapsed time passes it, no
+        new target is started (the remaining targets are recorded with no
+        findings and noted). ``None`` means no overall cap.
+
     Backward compatibility is the design constraint:
       * No targets (e.g. ``--iam-file`` alone) -> a single legacy run with the
         ``-o`` output path and ``domain=None``.
       * Exactly one target and no ``--output-dir`` -> a single legacy run writing
         to the ``-o`` path, byte-for-byte identical to the old single-domain flow.
       * Multiple targets, or ``--output-dir`` given -> each domain is scanned
-        sequentially into its OWN report at ``<output_dir>/<sanitized-domain>.json``
-        (plus ``.html``/``.sarif`` siblings when ``--format`` asks). Each domain is
-        its own scope root, because every ``run_full_scan`` call builds a fresh
+        into its OWN report at ``<output_dir>/<sanitized-domain>.json`` (plus
+        ``.html``/``.sarif`` siblings when ``--format`` asks). Each domain is its
+        own scope root, because every ``run_full_scan`` call builds a fresh
         ScopeManager, so findings never bleed across domains.
     """
     # Optional passive subdomain expansion: turn each root into its live
@@ -489,12 +530,17 @@ async def run_scans(
 
     # No domain at all (IAM/Burp/HAR-only): preserve the legacy single-call path.
     if not targets:
-        findings = await run_full_scan(domain=None, output=output, **scan_kwargs)
+        findings = await run_full_scan(
+            domain=None, output=output, target_timeout=target_timeout, **scan_kwargs
+        )
         return {"target": findings or []}
 
-    # Single target, no explicit output dir: EXACT legacy behavior.
+    # Single target, no explicit output dir: EXACT legacy behavior (plus the
+    # per-target time budget, so one huge host no longer runs unbounded).
     if len(targets) == 1 and not output_dir:
-        findings = await run_full_scan(domain=targets[0], output=output, **scan_kwargs)
+        findings = await run_full_scan(
+            domain=targets[0], output=output, target_timeout=target_timeout, **scan_kwargs
+        )
         return {targets[0]: findings or []}
 
     # Multi-domain (or single-domain-into-a-dir): one FOLDER per domain, holding
@@ -512,10 +558,14 @@ async def run_scans(
     results: dict[str, list] = {}
     summary_rows: list[tuple] = []
     used_names: set[str] = set()
+    run_started = time.monotonic()
+    skipped_over_budget = 0
 
-    async def _scan_one(index: int, domain: str) -> None:
-        # Resolve a unique per-domain folder name (guard against two inputs that
-        # sanitize to the same stem, e.g. "a.com" and "https://a.com/").
+    # Pre-assign a unique folder per domain up front (deterministic, and safe to
+    # do before any concurrency starts), so two inputs that sanitize to the same
+    # stem - "a.com" and "https://a.com/" - still get distinct folders.
+    domain_dirs: dict[str, Path] = {}
+    for domain in targets:
         stem = sanitize_domain_filename(domain)
         candidate = stem
         suffix = 2
@@ -523,8 +573,27 @@ async def run_scans(
             candidate = f"{stem}-{suffix}"
             suffix += 1
         used_names.add(candidate)
+        domain_dirs[domain] = out_dir / candidate
 
-        domain_dir = out_dir / candidate
+    def _over_budget() -> bool:
+        return (
+            max_duration is not None
+            and max_duration > 0
+            and (time.monotonic() - run_started) >= max_duration
+        )
+
+    async def _scan_one(domain: str) -> None:
+        nonlocal skipped_over_budget
+        # Overall run budget: once elapsed time passes --max-duration, do not
+        # start new targets - record them with no findings and note it, rather
+        # than letting the run drag on indefinitely.
+        if _over_budget():
+            skipped_over_budget += 1
+            results[domain] = []
+            summary_rows.append((domain, [], domain_dirs[domain]))
+            return
+
+        domain_dir = domain_dirs[domain]
         domain_dir.mkdir(parents=True, exist_ok=True)
         per_domain_output = domain_dir / "report.json"
         with _domain_output(domain_dir / "scan.log", verbose=verbose):
@@ -532,6 +601,7 @@ async def run_scans(
                 domain=domain,
                 output=str(per_domain_output),
                 artifacts_dir=domain_dir,
+                target_timeout=target_timeout,
                 **scan_kwargs,
             )
         results[domain] = findings or []
@@ -539,14 +609,18 @@ async def run_scans(
 
     if verbose:
         # Live, chatty per-domain output (the old behaviour), into the folders.
+        # Kept sequential so the streamed per-request log stays readable.
         for index, domain in enumerate(targets, start=1):
             status.print(
                 f"\n[bold cyan]=== [{index}/{len(targets)}] {domain} ===[/bold cyan]"
             )
-            await _scan_one(index, domain)
+            await _scan_one(domain)
     else:
-        # Clean terminal: just a progress bar; every verbose line goes to the
-        # per-domain scan.log instead.
+        # Clean terminal: a progress bar, with up to ``concurrency`` independent
+        # targets scanned at once. Each verbose line goes to the per-domain
+        # scan.log instead.
+        sem = asyncio.Semaphore(max(1, concurrency))
+
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
@@ -555,14 +629,199 @@ async def run_scans(
             TimeElapsedColumn(),
             console=status,
         ) as progress:
-            task = progress.add_task("Starting...", total=len(targets))
-            for index, domain in enumerate(targets, start=1):
-                progress.update(task, description=f"[{index}/{len(targets)}] {domain}")
-                await _scan_one(index, domain)
-                progress.advance(task)
+            task = progress.add_task(
+                f"Scanning (up to {max(1, concurrency)} at once)...", total=len(targets)
+            )
 
+            async def _worker(domain: str) -> None:
+                async with sem:
+                    await _scan_one(domain)
+                    progress.advance(task)
+
+            await asyncio.gather(*(_worker(domain) for domain in targets))
+
+    # Keep the summary in the original target order regardless of the order the
+    # concurrent scans happened to finish in.
+    order = {domain: i for i, domain in enumerate(targets)}
+    summary_rows.sort(key=lambda row: order.get(row[0], len(order)))
+
+    if skipped_over_budget:
+        status.print(
+            f"[yellow][!][/yellow] Overall time budget (--max-duration) reached: "
+            f"{skipped_over_budget} target(s) not scanned."
+        )
     _print_scan_summary(status, summary_rows, out_dir)
     return results
+
+
+async def _scan_endpoints(
+    *,
+    endpoints: list[str],
+    all_findings: list,
+    scanned: set,
+    scope,
+    http_engine,
+    canary,
+    token: str | None,
+    yaml_rules: list,
+    confirm_destructive: bool,
+    confirm_owned_infra: bool,
+    endpoint_concurrency: int = _DEFAULT_ENDPOINT_CONCURRENCY,
+    deadline: float | None = None,
+) -> int:
+    """Run the per-endpoint scanners (Auth Bypass, CORS, optional YAML rules,
+    parameter-discovery -> SSRF, and JWT) across every discovered endpoint, with
+    bounded concurrency.
+
+    The old implementation walked the endpoints one at a time, awaiting each
+    blocking scanner in turn; because a synchronous scanner stalled the whole
+    event loop, a host with many endpoints could take hours. Here up to
+    ``endpoint_concurrency`` endpoints are in flight at once, and
+    ``scanners.base.run_scanner`` offloads each blocking scanner to a worker
+    thread, so their network waits genuinely overlap. Concurrency is bounded by
+    a semaphore and every request still flows through the single shared,
+    scope-enforcing ``http_engine`` and its per-host ``AdaptiveRateLimiter``, so
+    same-host traffic stays rate-limited exactly as before - the parallelism
+    only fills the idle time between requests.
+
+    ``deadline`` (a ``time.monotonic()`` value) is the per-target budget: once it
+    passes, no further endpoints start their scanners; the endpoints already
+    finished keep their findings and the scan proceeds to write them. Returns
+    the number of endpoints skipped because the budget was exhausted.
+    """
+    sem = asyncio.Semaphore(max(1, endpoint_concurrency))
+    skipped = 0
+
+    async def _scan_one_endpoint(ep_url: str) -> None:
+        nonlocal skipped
+        async with sem:
+            # Per-target budget: stop launching new endpoint work once the
+            # wall-clock deadline has passed. Already-running endpoints finish;
+            # the rest are skipped and reported, and whatever was found is kept.
+            if deadline is not None and time.monotonic() >= deadline:
+                skipped += 1
+                return
+
+            console.print(f"[cyan]  ->[/cyan] {ep_url}")
+            # Accumulate into a local list, then extend the shared list once, so
+            # a partially-scanned endpoint contributes all-or-nothing and the
+            # shared aggregation stays simple under concurrency.
+            local: list = []
+
+            try:
+                authz_scanner = AuthzBypassScanner(
+                    scope_manager=scope,
+                    http_engine=http_engine,
+                    confirm_destructive=confirm_destructive,
+                )
+                local += await run_scanner(
+                    authz_scanner,
+                    AuthzBypassTarget(
+                        url=ep_url,
+                        include_destructive_methods=confirm_destructive,
+                        # Differential baseline: without it, every catch-all /
+                        # SPA route or public page that answers 200 with no
+                        # auth is reported as a critical missing authorizer.
+                        soft_404_probe_url=_soft_404_probe_url(ep_url),
+                    ),
+                )
+                local += await run_scanner(
+                    CorsMisconfigScanner(scope_manager=scope, http_engine=http_engine),
+                    CorsMisconfigTarget(url=ep_url),
+                )
+                scanned.add(("authz_bypass", ep_url))
+                scanned.add(("cors_misconfig", ep_url))
+            except ScannerConfirmationError as e:
+                console.print(f"[yellow]    [!][/yellow] Auth Bypass skipped: {e}")
+            except Exception as e:
+                console.print(f"[yellow]    [!][/yellow] Auth Bypass failed: {e}")
+
+            # --- Declarative YAML rules (opt-in via --rules). Runs the loaded
+            # http-endpoint rules through the same scope/safety-enforcing engine.
+            # Findings dedupe against the code scanners above when they overlap.
+            if yaml_rules:
+                try:
+                    rule_scanner = RuleScanner(
+                        rules=yaml_rules,
+                        scope_manager=scope,
+                        http_engine=http_engine,
+                        confirm_owned_infra=confirm_owned_infra,
+                    )
+                    local += await run_scanner(
+                        rule_scanner, RuleScanTarget(url=ep_url)
+                    )
+                    scanned.add(("rule_scanner", ep_url))
+                except Exception as e:
+                    console.print(f"[yellow]    [!][/yellow] YAML rules failed: {e}")
+
+            try:
+                # Use the full Arjun-derived wordlist (no artificial 300-param
+                # cap) so uncommon URL/webhook/redirect parameter names that
+                # back real SSRF are not missed.
+                pconfig = ParameterDiscoveryConfig(url=ep_url, max_params=2000)
+                # discover_parameters is a synchronous, potentially slow
+                # call (up to max_params sequential HTTP requests). It is
+                # offloaded to a worker thread so it never blocks this
+                # coroutine's event loop while it runs.
+                discovery_result = await asyncio.to_thread(
+                    discover_parameters, pconfig, scope, http_engine
+                )
+                ssrf_params = select_ssrf_candidates(discovery_result)
+                if discovery_result.probe_errors:
+                    console.print(
+                        f"[yellow]    [!][/yellow] Parameter discovery: "
+                        f"{discovery_result.probe_errors}/{discovery_result.probes_sent} probes failed"
+                    )
+                for param_name in ssrf_params:
+                    console.print(f"[cyan]    [*][/cyan] SSRF candidate: {param_name}")
+                    ssrf_target = SsrfImdsTarget(
+                        url=ep_url, param_name=param_name, canary_server=canary
+                    )
+                    ssrf_scanner = SsrfImdsScanner(
+                        scope_manager=scope,
+                        http_engine=http_engine,
+                        confirm_owned_infra=confirm_owned_infra,
+                    )
+                    local += await run_scanner(ssrf_scanner, ssrf_target)
+                    scanned.add(("ssrf_imds", ep_url))
+            except ScannerConfirmationError as e:
+                console.print(f"[yellow]    [!][/yellow] SSRF skipped: {e}")
+            except Exception as e:
+                console.print(f"[yellow]    [!][/yellow] Parameter discovery failed: {e}")
+
+            if token:
+                try:
+                    # canary_server wires the OOB backend so jku + x5u header
+                    # injection confirm via a real callback; check_weak_secret
+                    # is off here because the weak-HS256 check already ran once
+                    # centrally above (it is a token property, not per-endpoint).
+                    jwt_target = JwtTarget(
+                        url=ep_url,
+                        sample_token=token,
+                        canary_server=canary,
+                        check_weak_secret=False,
+                    )
+                    local += await run_scanner(
+                        JwtTamperScanner(scope_manager=scope, http_engine=http_engine),
+                        jwt_target,
+                    )
+                    scanned.add(("jwt_tamper", ep_url))
+                except Exception as e:
+                    console.print(f"[yellow]    [!][/yellow] JWT check failed: {e}")
+
+            # Mutate the caller's list in place (extend, not +=) so the shared
+            # aggregation holds across all concurrent endpoint workers.
+            all_findings.extend(local)
+
+    await asyncio.gather(*(_scan_one_endpoint(ep) for ep in endpoints))
+
+    if skipped:
+        console.print(
+            f"[yellow][!][/yellow] Per-target time budget reached: skipped "
+            f"{skipped} of {len(endpoints)} endpoint(s). Partial results are "
+            "still written (raise --target-timeout, or 0 to disable)."
+        )
+    return skipped
 
 
 async def run_full_scan(
@@ -601,8 +860,18 @@ async def run_full_scan(
     oob_public_url: str | None = None,
     ml_model: str | None = None,
     artifacts_dir: str | Path | None = None,
+    endpoint_concurrency: int = _DEFAULT_ENDPOINT_CONCURRENCY,
+    target_timeout: float | None = _DEFAULT_TARGET_TIMEOUT,
 ) -> list:
     all_findings: list = []
+
+    # Per-target wall-clock budget. The per-endpoint scan loop below checks this
+    # deadline and stops queueing new endpoints once it passes, so one large or
+    # slow host can no longer run for hours - whatever was found so far is still
+    # written and the run moves on. None / <=0 disables the budget entirely.
+    deadline: float | None = None
+    if target_timeout and target_timeout > 0:
+        deadline = time.monotonic() + target_timeout
 
     # Optional extra wordlist for the weak-HS256-secret check. Loaded once,
     # one candidate per non-blank line; a bad path is a warning, not a failure.
@@ -990,109 +1259,20 @@ async def run_full_scan(
             )
 
     try:
-        for ep_url in endpoints:
-            console.print(f"[cyan]  ->[/cyan] {ep_url}")
-
-            try:
-                authz_scanner = AuthzBypassScanner(
-                    scope_manager=scope,
-                    http_engine=http_engine,
-                    confirm_destructive=confirm_destructive,
-                )
-                all_findings += await run_scanner(
-                    authz_scanner,
-                    AuthzBypassTarget(
-                        url=ep_url,
-                        include_destructive_methods=confirm_destructive,
-                        # Differential baseline: without it, every catch-all /
-                        # SPA route or public page that answers 200 with no
-                        # auth is reported as a critical missing authorizer.
-                        soft_404_probe_url=_soft_404_probe_url(ep_url),
-                    ),
-                )
-                all_findings += await run_scanner(
-                    CorsMisconfigScanner(scope_manager=scope, http_engine=http_engine),
-                    CorsMisconfigTarget(url=ep_url),
-                )
-                scanned.add(("authz_bypass", ep_url))
-                scanned.add(("cors_misconfig", ep_url))
-            except ScannerConfirmationError as e:
-                console.print(f"[yellow]    [!][/yellow] Auth Bypass skipped: {e}")
-            except Exception as e:
-                console.print(f"[yellow]    [!][/yellow] Auth Bypass failed: {e}")
-
-            # --- Declarative YAML rules (opt-in via --rules). Runs the loaded
-            # http-endpoint rules through the same scope/safety-enforcing engine.
-            # Findings dedupe against the code scanners above when they overlap.
-            if yaml_rules:
-                try:
-                    rule_scanner = RuleScanner(
-                        rules=yaml_rules,
-                        scope_manager=scope,
-                        http_engine=http_engine,
-                        confirm_owned_infra=confirm_owned_infra,
-                    )
-                    all_findings += await run_scanner(
-                        rule_scanner, RuleScanTarget(url=ep_url)
-                    )
-                    scanned.add(("rule_scanner", ep_url))
-                except Exception as e:
-                    console.print(f"[yellow]    [!][/yellow] YAML rules failed: {e}")
-
-            try:
-                # Use the full Arjun-derived wordlist (no artificial 300-param
-                # cap) so uncommon URL/webhook/redirect parameter names that
-                # back real SSRF are not missed.
-                pconfig = ParameterDiscoveryConfig(url=ep_url, max_params=2000)
-                # discover_parameters is a synchronous, potentially slow
-                # call (up to max_params sequential HTTP requests). It is
-                # offloaded to a worker thread so it never blocks this
-                # coroutine's event loop while it runs.
-                discovery_result = await asyncio.to_thread(
-                    discover_parameters, pconfig, scope, http_engine
-                )
-                ssrf_params = select_ssrf_candidates(discovery_result)
-                if discovery_result.probe_errors:
-                    console.print(
-                        f"[yellow]    [!][/yellow] Parameter discovery: "
-                        f"{discovery_result.probe_errors}/{discovery_result.probes_sent} probes failed"
-                    )
-                for param_name in ssrf_params:
-                    console.print(f"[cyan]    [*][/cyan] SSRF candidate: {param_name}")
-                    ssrf_target = SsrfImdsTarget(
-                        url=ep_url, param_name=param_name, canary_server=canary
-                    )
-                    ssrf_scanner = SsrfImdsScanner(
-                        scope_manager=scope,
-                        http_engine=http_engine,
-                        confirm_owned_infra=confirm_owned_infra,
-                    )
-                    all_findings += await run_scanner(ssrf_scanner, ssrf_target)
-                    scanned.add(("ssrf_imds", ep_url))
-            except ScannerConfirmationError as e:
-                console.print(f"[yellow]    [!][/yellow] SSRF skipped: {e}")
-            except Exception as e:
-                console.print(f"[yellow]    [!][/yellow] Parameter discovery failed: {e}")
-
-            if token:
-                try:
-                    # canary_server wires the OOB backend so jku + x5u header
-                    # injection confirm via a real callback; check_weak_secret
-                    # is off here because the weak-HS256 check already ran once
-                    # centrally above (it is a token property, not per-endpoint).
-                    jwt_target = JwtTarget(
-                        url=ep_url,
-                        sample_token=token,
-                        canary_server=canary,
-                        check_weak_secret=False,
-                    )
-                    all_findings += await run_scanner(
-                        JwtTamperScanner(scope_manager=scope, http_engine=http_engine),
-                        jwt_target,
-                    )
-                    scanned.add(("jwt_tamper", ep_url))
-                except Exception as e:
-                    console.print(f"[yellow]    [!][/yellow] JWT check failed: {e}")
+        await _scan_endpoints(
+            endpoints=endpoints,
+            all_findings=all_findings,
+            scanned=scanned,
+            scope=scope,
+            http_engine=http_engine,
+            canary=canary,
+            token=token,
+            yaml_rules=yaml_rules,
+            confirm_destructive=confirm_destructive,
+            confirm_owned_infra=confirm_owned_infra,
+            endpoint_concurrency=endpoint_concurrency,
+            deadline=deadline,
+        )
     finally:
         if canary:
             canary.stop()

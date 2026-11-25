@@ -7,6 +7,7 @@ abstractmethod - both styles subclass this without conflict. Use
 currently calls each scanner's ``run()`` directly instead.
 """
 
+import asyncio
 import datetime as _dt
 import inspect
 from abc import ABC
@@ -54,7 +55,20 @@ def is_async_scanner(scanner: BaseScanner) -> bool:
 
 
 async def run_scanner(scanner: BaseScanner, target) -> list[Finding]:
-    """Uniform adapter that runs run() whether it is sync or async."""
+    """Uniform adapter that runs run() whether it is sync or async.
+
+    An async scanner (BOLA) is awaited directly. A *synchronous* scanner -
+    which is every other scanner, and which drives blocking ``requests`` calls
+    through the shared :class:`HttpEngine` - is offloaded to a worker thread via
+    ``asyncio.to_thread`` rather than being called inline. Inline execution of a
+    blocking ``run()`` would stall the entire event loop for the full duration
+    of that scanner's network I/O, so even when the caller ``gather``s many
+    endpoints "concurrently" they would in fact run one at a time. Offloading
+    lets those blocking calls genuinely overlap. Safety is unchanged: every
+    request still goes through the same scope-enforcing HttpEngine and the
+    thread-safe :class:`AdaptiveRateLimiter`, so overlapping requests to the
+    same host stay rate-limited exactly as before.
+    """
     if is_async_scanner(scanner):
         return await scanner.run(target)
-    return scanner.run(target)
+    return await asyncio.to_thread(scanner.run, target)

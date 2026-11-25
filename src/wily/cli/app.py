@@ -247,6 +247,45 @@ def scan_command(
         None, "--subfinder-path",
         help="Path to the subfinder binary if it is not on PATH.",
     ),
+    concurrency: int = typer.Option(
+        scan_all._DEFAULT_TARGET_CONCURRENCY, "--concurrency",
+        help=(
+            "How many targets (hosts) to scan at once. Different hosts are "
+            "independent - each gets its own scope, rate limiter and HTTP "
+            "engine - so this is the main speed-up on a multi-subdomain sweep. "
+            f"Default: {scan_all._DEFAULT_TARGET_CONCURRENCY}. Set 1 to scan "
+            "strictly one host at a time (the old behaviour)."
+        ),
+    ),
+    endpoint_concurrency: int = typer.Option(
+        scan_all._DEFAULT_ENDPOINT_CONCURRENCY, "--endpoint-concurrency",
+        help=(
+            "How many of a single host's endpoints to scan at once. All requests "
+            "still go through the one shared, scope-enforcing HTTP engine and its "
+            "per-host rate limiter, so same-host traffic stays rate-limited; this "
+            "just overlaps the idle network wait instead of scanning endpoints "
+            f"strictly one by one. Default: {scan_all._DEFAULT_ENDPOINT_CONCURRENCY}."
+        ),
+    ),
+    target_timeout: float = typer.Option(
+        scan_all._DEFAULT_TARGET_TIMEOUT, "--target-timeout",
+        help=(
+            "Per-target wall-clock budget in seconds. When a host's endpoint "
+            "scan passes this, the remaining endpoints are skipped, whatever was "
+            "already found is written, and the run moves to the next target - so "
+            "one huge or slow host can no longer stall the whole run for hours. "
+            f"Default: {int(scan_all._DEFAULT_TARGET_TIMEOUT)}s. Set 0 to disable "
+            "(fully unbounded, as before)."
+        ),
+    ),
+    max_duration: float = typer.Option(
+        0.0, "--max-duration",
+        help=(
+            "Overall wall-clock budget in seconds across ALL targets. Once "
+            "elapsed time passes it, no new target is started (the rest are "
+            "recorded with no findings and noted). Default: 0 (no overall cap)."
+        ),
+    ),
     output: str = typer.Option(
         "wily-report.json", "-o", "--output",
         help=(
@@ -459,6 +498,10 @@ def scan_command(
                 enum_subdomains=subdomains,
                 subdomain_max=subdomain_max,
                 subfinder_path=subfinder_path,
+                concurrency=concurrency,
+                endpoint_concurrency=endpoint_concurrency,
+                target_timeout=(target_timeout if target_timeout and target_timeout > 0 else None),
+                max_duration=(max_duration if max_duration and max_duration > 0 else None),
                 token=token,
                 identities_raw=identity or [],
                 token_pool=token_pool,
