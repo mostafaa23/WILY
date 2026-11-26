@@ -182,6 +182,65 @@ def scan_command(
             "probe goes through the shared, scope-enforced HTTP engine."
         ),
     ),
+    # --- Opt-in, single-URL probes. Each needs a tester-supplied target, so it
+    # cannot run on a plain domain sweep (same category as BOLA). Passing the
+    # flag IS the explicit opt-in; each runs once and folds into the report. ---
+    session_fixation_login: str = typer.Option(
+        None, "--session-fixation-login", metavar="URL",
+        help=(
+            "Opt-in session-fixation check (OWASP A07): URL of the login page "
+            "whose pre-auth session cookie is captured. Also set "
+            "--session-fixation-body with the login credentials."
+        ),
+    ),
+    session_fixation_submit: str = typer.Option(
+        None, "--session-fixation-submit", metavar="URL",
+        help="Login form submit URL for --session-fixation-login (default: the login URL).",
+    ),
+    session_fixation_body: str = typer.Option(
+        None, "--session-fixation-body", metavar="BODY",
+        help="Login POST body, e.g. 'username=admin&password=secret'.",
+    ),
+    timing_enum_url: str = typer.Option(
+        None, "--timing-enum-url", metavar="URL",
+        help=(
+            "Opt-in account-enumeration timing probe: login/auth URL. ACTIVE - "
+            "sends several login attempts per username to compare response "
+            "timing. Set --timing-known-invalid and --timing-candidates."
+        ),
+    ),
+    timing_known_invalid: str = typer.Option(
+        None, "--timing-known-invalid", metavar="a,b,c",
+        help="Comma-separated usernames known NOT to exist (the timing baseline).",
+    ),
+    timing_candidates: str = typer.Option(
+        None, "--timing-candidates", metavar="x,y,z",
+        help="Comma-separated usernames to test for a timing side channel.",
+    ),
+    token_entropy_url: str = typer.Option(
+        None, "--token-entropy-url", metavar="URL",
+        help=(
+            "Opt-in token-randomness probe: a URL that issues a session/CSRF "
+            "token. ACTIVE - sends many requests to sample tokens. Set one of "
+            "--token-entropy-cookie or --token-entropy-pattern."
+        ),
+    ),
+    token_entropy_cookie: str = typer.Option(
+        None, "--token-entropy-cookie", metavar="NAME",
+        help="Set-Cookie name holding the token to sample (for --token-entropy-url).",
+    ),
+    token_entropy_pattern: str = typer.Option(
+        None, "--token-entropy-pattern", metavar="REGEX",
+        help="Body regex with ONE capture group holding the token (alternative to --token-entropy-cookie).",
+    ),
+    stage_template: str = typer.Option(
+        None, "--stage-template", metavar="URL",
+        help=(
+            "Opt-in API Gateway stage-inconsistency check: a URL containing the "
+            "literal '{stage}', e.g. 'https://{stage}.api.example.com/private'. "
+            "Compares non-prod stages against the protected prod baseline."
+        ),
+    ),
     cloud_enum: bool = typer.Option(
         False, "--cloud-enum/--no-cloud-enum",
         help=(
@@ -452,7 +511,26 @@ def scan_command(
         typer.echo(f"Could not read --targets-file: {e}", err=True)
         raise typer.Exit(code=2) from e
 
-    if not targets and not iam_file and not burp_xml and not import_har:
+    def _csv(value: str | None) -> tuple[str, ...]:
+        return tuple(s.strip() for s in value.split(",") if s.strip()) if value else ()
+
+    optional_probes = scan_all.OptionalProbes(
+        session_fixation_login=session_fixation_login,
+        session_fixation_submit=session_fixation_submit,
+        session_fixation_body=session_fixation_body or "",
+        timing_url=timing_enum_url,
+        timing_invalid_users=_csv(timing_known_invalid),
+        timing_candidate_users=_csv(timing_candidates),
+        token_entropy_url=token_entropy_url,
+        token_entropy_cookie=token_entropy_cookie,
+        token_entropy_pattern=token_entropy_pattern,
+        stage_template=stage_template,
+    )
+
+    if (
+        not targets and not iam_file and not burp_xml and not import_har
+        and not optional_probes.any_enabled()
+    ):
         typer.echo(
             "You must provide at least one domain, --targets-file, --iam-file, "
             "--burp-xml or --import-har at minimum. Try: wily scan --help",
@@ -498,6 +576,7 @@ def scan_command(
                 enum_subdomains=subdomains,
                 subdomain_max=subdomain_max,
                 subfinder_path=subfinder_path,
+                optional_probes=optional_probes,
                 concurrency=concurrency,
                 endpoint_concurrency=endpoint_concurrency,
                 target_timeout=(target_timeout if target_timeout and target_timeout > 0 else None),

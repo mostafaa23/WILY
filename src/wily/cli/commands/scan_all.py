@@ -19,6 +19,7 @@ import logging
 import re
 import secrets
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -73,6 +74,8 @@ from wily.scanners.authz_bypass import (
     AuthzBypassTarget,
     CorsMisconfigScanner,
     CorsMisconfigTarget,
+    StageInconsistencyScanner,
+    StageInconsistencyTarget,
 )
 from wily.scanners.base import Finding, ScannerConfirmationError, run_scanner
 from wily.scanners.bola import BolaTester, Identity
@@ -99,8 +102,15 @@ from wily.scanners.secret_scan import (
     SecretScanTarget,
     SecretSource,
 )
+from wily.scanners.session_fixation import (
+    SessionFixationScanner,
+    SessionFixationTarget,
+)
 from wily.scanners.ssrf_imds import SsrfImdsScanner, SsrfImdsTarget
 from wily.scanners.takeover import TakeoverScanner, TakeoverTarget
+from wily.scanners.timing_enum import TimingEnumScanner, TimingEnumTarget
+from wily.scanners.tls_config import TlsConfigScanner, TlsConfigTarget
+from wily.scanners.token_entropy import TokenEntropyScanner, TokenEntropyTarget
 from wily.templates.loader import load_rules
 
 console = Console(stderr=True)
@@ -518,6 +528,17 @@ async def run_scans(
         own scope root, because every ``run_full_scan`` call builds a fresh
         ScopeManager, so findings never bleed across domains.
     """
+    # Opt-in, single-URL probes (session fixation, timing enum, token entropy,
+    # stage inconsistency). They target a tester-supplied URL, so they run ONCE
+    # here, not per discovered target/subdomain; their findings are injected
+    # into the first report via ``extra_findings``.
+    optional_probes = scan_kwargs.pop("optional_probes", None)
+    probe_findings: list = []
+    if optional_probes is not None and optional_probes.any_enabled():
+        probe_findings = await _run_optional_probes(
+            optional_probes, allow_local=bool(scan_kwargs.get("allow_local", False))
+        )
+
     # Optional passive subdomain expansion: turn each root into its live
     # subdomains (subfinder) before scanning, and persist the full target list.
     if enum_subdomains and targets:
@@ -531,7 +552,8 @@ async def run_scans(
     # No domain at all (IAM/Burp/HAR-only): preserve the legacy single-call path.
     if not targets:
         findings = await run_full_scan(
-            domain=None, output=output, target_timeout=target_timeout, **scan_kwargs
+            domain=None, output=output, target_timeout=target_timeout,
+            extra_findings=probe_findings, **scan_kwargs
         )
         return {"target": findings or []}
 
@@ -539,7 +561,8 @@ async def run_scans(
     # per-target time budget, so one huge host no longer runs unbounded).
     if len(targets) == 1 and not output_dir:
         findings = await run_full_scan(
-            domain=targets[0], output=output, target_timeout=target_timeout, **scan_kwargs
+            domain=targets[0], output=output, target_timeout=target_timeout,
+            extra_findings=probe_findings, **scan_kwargs
         )
         return {targets[0]: findings or []}
 
@@ -602,6 +625,8 @@ async def run_scans(
                 output=str(per_domain_output),
                 artifacts_dir=domain_dir,
                 target_timeout=target_timeout,
+                # The once-per-run opt-in probes land in the first domain's report.
+                extra_findings=probe_findings if domain == targets[0] else None,
                 **scan_kwargs,
             )
         results[domain] = findings or []
@@ -862,8 +887,11 @@ async def run_full_scan(
     artifacts_dir: str | Path | None = None,
     endpoint_concurrency: int = _DEFAULT_ENDPOINT_CONCURRENCY,
     target_timeout: float | None = _DEFAULT_TARGET_TIMEOUT,
+    extra_findings: list | None = None,
 ) -> list:
-    all_findings: list = []
+    # Seeded with any pre-computed findings (e.g. the once-per-run opt-in
+    # probes) so they are triaged and written into this report like the rest.
+    all_findings: list = list(extra_findings) if extra_findings else []
 
     # Per-target wall-clock budget. The per-endpoint scan loop below checks this
     # deadline and stops queueing new endpoints once it passes, so one large or
@@ -1130,6 +1158,14 @@ async def run_full_scan(
     # discovered JS + imported traffic, takeover off discovered hosts. They run
     # even when no API endpoints were found (e.g. a pure bucket-scope scan). ---
     s3_scan_targets: dict[str, tuple] = {}  # asset -> (engine, target) for follow-ups
+    # Off-endpoint assets discovery saw the target reference: AWS S3 bucket URLs
+    # and the target's own JS bundles. Feeding these in is what makes the S3 and
+    # secret / IAM-clue scanners run automatically on a plain `wily scan <domain>`
+    # (previously they only fired with --scope-bucket or a traffic import).
+    discovered_s3_refs = tuple(sorted(getattr(report, "cloud_assets", set())))
+    discovered_js = tuple(
+        u for u in sorted(getattr(report, "js_assets", set())) if scope.is_in_scope(u)
+    )
     await _run_cloud_scanners(
         all_findings=all_findings,
         scanned=scanned,
@@ -1144,6 +1180,8 @@ async def run_full_scan(
         allow_local=allow_local,
         confirm_s3_writes=confirm_s3_writes,
         s3_lab_write=s3_lab_write,
+        discovered_s3_refs=discovered_s3_refs,
+        discovered_js=discovered_js,
     )
 
     # --- Cloud resource enumeration (cloud_enum-style). Opt-in via --cloud-enum:
@@ -1427,6 +1465,121 @@ def _cname_resolver(host: str) -> str | None:
     return aliases[-1] if aliases else None
 
 
+@dataclass
+class OptionalProbes:
+    """Inputs for the opt-in, single-URL scanners that need a tester-supplied
+    target and so cannot run on a plain domain sweep (same category as BOLA).
+
+    Each is enabled only when its primary field is set; passing the flag IS the
+    explicit opt-in, so the active-probe confirmations (timing / token entropy)
+    are taken as granted. They run ONCE per invocation (not per subdomain), and
+    their findings are folded into the primary report.
+    """
+
+    # session_fixation (OWASP A07): does the session cookie survive login?
+    session_fixation_login: str | None = None
+    session_fixation_submit: str | None = None
+    session_fixation_body: str = ""
+    # timing_enum: account enumeration via a login-timing side channel.
+    timing_url: str | None = None
+    timing_invalid_users: tuple[str, ...] = ()
+    timing_candidate_users: tuple[str, ...] = ()
+    # token_entropy: statistical weakness in issued session/CSRF tokens.
+    token_entropy_url: str | None = None
+    token_entropy_cookie: str | None = None
+    token_entropy_pattern: str | None = None
+    # stage_inconsistency: a non-prod API Gateway stage left unprotected.
+    stage_template: str | None = None
+
+    def any_enabled(self) -> bool:
+        return bool(
+            self.session_fixation_login
+            or self.timing_url
+            or self.token_entropy_url
+            or self.stage_template
+        )
+
+
+def _probe_engine(url: str, allow_local: bool) -> tuple[ScopeManager, HttpEngine]:
+    """A fresh scope+engine authorized for the probe URL's host. The user
+    supplying the URL is the authorization; the engine still enforces it."""
+    host = urlparse(url).hostname or url
+    scope = ScopeManager(host, allow_local_targets=allow_local)
+    return scope, HttpEngine(scope_manager=scope)
+
+
+async def _run_optional_probes(probes: OptionalProbes, *, allow_local: bool) -> list:
+    """Run each configured opt-in probe once and return the pooled findings.
+
+    Every probe is isolated in its own try/except so one bad input never aborts
+    the others or the surrounding scan.
+    """
+    findings: list = []
+    if not probes.any_enabled():
+        return findings
+
+    if probes.session_fixation_login:
+        _scope, engine = _probe_engine(probes.session_fixation_login, allow_local)
+        try:
+            findings += await run_scanner(
+                SessionFixationScanner(http_engine=engine),
+                SessionFixationTarget(
+                    login_page_url=probes.session_fixation_login,
+                    login_submit_url=(
+                        probes.session_fixation_submit or probes.session_fixation_login
+                    ),
+                    credentials_body=probes.session_fixation_body,
+                ),
+            )
+            console.print("[cyan]    [*][/cyan] Session-fixation probe ran.")
+        except Exception as e:
+            console.print(f"[yellow]    [!][/yellow] Session-fixation probe failed: {e}")
+
+    if probes.timing_url:
+        _scope, engine = _probe_engine(probes.timing_url, allow_local)
+        try:
+            findings += await run_scanner(
+                TimingEnumScanner(http_engine=engine, confirm_timing_probe=True),
+                TimingEnumTarget(
+                    url=probes.timing_url,
+                    known_invalid_users=list(probes.timing_invalid_users),
+                    candidate_users=list(probes.timing_candidate_users),
+                ),
+            )
+            console.print("[cyan]    [*][/cyan] Timing-enumeration probe ran.")
+        except Exception as e:
+            console.print(f"[yellow]    [!][/yellow] Timing-enumeration probe failed: {e}")
+
+    if probes.token_entropy_url:
+        _scope, engine = _probe_engine(probes.token_entropy_url, allow_local)
+        try:
+            findings += await run_scanner(
+                TokenEntropyScanner(http_engine=engine, confirm_deep_analysis=True),
+                TokenEntropyTarget(
+                    url=probes.token_entropy_url,
+                    cookie_name=probes.token_entropy_cookie,
+                    body_pattern=probes.token_entropy_pattern,
+                ),
+            )
+            console.print("[cyan]    [*][/cyan] Token-entropy probe ran.")
+        except Exception as e:
+            console.print(f"[yellow]    [!][/yellow] Token-entropy probe failed: {e}")
+
+    if probes.stage_template:
+        baseline_url = probes.stage_template.replace("{stage}", "prod")
+        scope, engine = _probe_engine(baseline_url, allow_local)
+        try:
+            findings += await run_scanner(
+                StageInconsistencyScanner(scope_manager=scope, http_engine=engine),
+                StageInconsistencyTarget(url_template=probes.stage_template),
+            )
+            console.print("[cyan]    [*][/cyan] Stage-inconsistency probe ran.")
+        except Exception as e:
+            console.print(f"[yellow]    [!][/yellow] Stage-inconsistency probe failed: {e}")
+
+    return findings
+
+
 async def _run_cloud_scanners(
     *,
     all_findings: list,
@@ -1442,19 +1595,28 @@ async def _run_cloud_scanners(
     allow_local: bool,
     confirm_s3_writes: bool,
     s3_lab_write: bool = False,
+    discovered_s3_refs: tuple[str, ...] = (),
+    discovered_js: tuple[str, ...] = (),
 ) -> None:
     """Run the Phase 3 cloud scanners and fold their findings into the run.
 
     Each scanner is isolated in its own try/except so a failure in one (or a
     single bad target) never aborts the scan.
+
+    ``discovered_s3_refs`` / ``discovered_js`` are off-endpoint assets the
+    discovery pass saw the target reference (bucket URLs and JS bundles). They
+    are what makes the S3 and secret / IAM-clue scanners fire automatically on a
+    plain domain scan, instead of only with --scope-bucket or an import.
     """
     # ---- S3 bucket misconfiguration ------------------------------------
     # Candidate references: explicit bucket scope + imported s3 links + any S3
-    # URLs discovered among endpoints. Deduplicated by concrete bucket name.
+    # URLs among endpoints + bucket URLs discovery saw in the page/JS.
+    # Deduplicated by concrete bucket name.
     s3_refs: list[str] = list(buckets)
     if imported and imported.s3_links:
         s3_refs += imported.s3_links
     s3_refs += [ep for ep in endpoints if extract_bucket_name(ep)]
+    s3_refs += list(discovered_s3_refs)
 
     seen_buckets: set[str] = set()
     for ref in s3_refs:
@@ -1513,6 +1675,12 @@ async def _run_cloud_scanners(
         ep for ep in endpoints
         if urlparse(ep).path.lower().endswith(".js") and scope.is_in_scope(ep)
     ]
+    # JS bundles discovery referenced but did not emit as endpoints (their URL
+    # is dropped as a non-API static asset); fetch them here for secret/IAM
+    # scanning. Scope is still enforced by the scanner's own engine.
+    for u in discovered_js:
+        if scope.is_in_scope(u) and u not in js_urls:
+            js_urls.append(u)
     if secret_sources or js_urls:
         try:
             found = await run_scanner(
@@ -1586,6 +1754,24 @@ async def _run_cloud_scanners(
                 console.print(f"[cyan]    [*][/cyan] Takeover indicator on {host}: {len(found)}.")
         except Exception as e:
             console.print(f"[yellow]    [!][/yellow] Takeover scan failed for {host}: {e}")
+
+    # ---- TLS/SSL configuration (always-on, read-only) ------------------
+    # A TLS handshake is as safe as a GET and needs no input beyond the host,
+    # so it runs automatically on every in-scope host. Skipped for --allow-local
+    # targets (the scanner refuses private/loopback addresses anyway).
+    if not allow_local:
+        for host in hosts:
+            try:
+                found = await run_scanner(
+                    TlsConfigScanner(scope_manager=scope),
+                    TlsConfigTarget(host=host),
+                )
+                all_findings += found
+                scanned.add(("tls_config", host))
+                if found:
+                    console.print(f"[cyan]    [*][/cyan] TLS config on {host}: {len(found)} finding(s).")
+            except Exception as e:
+                console.print(f"[yellow]    [!][/yellow] TLS config scan failed for {host}: {e}")
 
 
 def _provider_engine_factory(allow_local: bool, rate_limiter, timeout: float = 10.0):

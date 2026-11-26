@@ -350,6 +350,34 @@ ATTR_RE = re.compile(
     r"""([A-Za-z_:][-A-Za-z0-9_:.]*)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))"""
 )
 
+# AWS S3 bucket references that a page or its JS points at. These are
+# deliberately OFF the HTTP-endpoint scope (a bucket host is not same-site as
+# the target, so ``_ingest_candidate`` drops them), yet they are exactly what
+# the S3 misconfiguration scanner needs. They are collected separately and
+# handed to the cloud scanners, so S3 runs automatically on a plain domain scan
+# whenever the target itself references a bucket - no --scope-bucket needed.
+# Matches the three forms ``extract_bucket_name`` understands: s3:// URIs,
+# virtual-hosted ``bucket.s3[.-region].amazonaws.com`` and path-style
+# ``s3[.-region].amazonaws.com/bucket``.
+S3_REFERENCE_RE = re.compile(
+    r"""(?ix)
+    (?:
+        s3://[a-z0-9][a-z0-9.\-]{1,61}[a-z0-9](?:/[^\s"'<>)\]}]*)?
+      | https?://
+        (?:
+            [a-z0-9][a-z0-9.\-]{1,61}\.s3(?:[.\-][a-z0-9\-]+)*\.amazonaws\.com
+          | s3(?:[.\-][a-z0-9\-]+)*\.amazonaws\.com/[a-z0-9][a-z0-9.\-]{1,61}
+        )
+        (?:/[^\s"'<>)\]}]*)?
+    )
+    """
+)
+
+# Script-asset extensions whose *URL itself* is worth keeping (so the secret /
+# IAM-clue scanners can fetch and scan the bundle). ``_ingest_candidate`` drops
+# these as endpoints (they are not API routes), so they are recorded separately.
+_JS_ASSET_SUFFIXES = (".js", ".mjs", ".cjs")
+
 
 # ---------------------------------------------------------------------------
 # Small pure helpers (unit-testable, no I/O)
@@ -650,6 +678,11 @@ class DiscoveryReport:
     endpoints: dict[str, EndpointRecord] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
     stats: dict[str, Any] = field(default_factory=dict)
+    # Off-endpoint assets the target references, collected for the cloud
+    # scanners (they are not HTTP API endpoints, so they are not in
+    # ``endpoints``): AWS S3 bucket URLs and the target's own JS bundle URLs.
+    cloud_assets: set[str] = field(default_factory=set)
+    js_assets: set[str] = field(default_factory=set)
 
     def add_endpoint(
         self,
@@ -735,6 +768,8 @@ class DiscoveryReport:
                 }
                 for url, record in sorted(self.endpoints.items())
             },
+            "cloud_assets": sorted(self.cloud_assets),
+            "js_assets": sorted(self.js_assets),
             "errors": _capped_errors(self.errors),
         }
 
@@ -1298,6 +1333,10 @@ class ApiDiscoveryPipeline:
             if not self.cfg.include_external_js and not same_site(host, self.host):
                 return
             seen.add(key)
+            # Keep the JS bundle URL itself (dropped as an endpoint) so the
+            # secret / IAM-clue scanners can fetch and scan it for leaked keys.
+            if urlparse(key).path.lower().endswith(_JS_ASSET_SUFFIXES):
+                report.js_assets.add(key)
             queue.put_nowait(key)
 
         # 1) Inline HTML (window.__CONFIG__, data attributes, <a href> hints).
@@ -1355,6 +1394,14 @@ class ApiDiscoveryPipeline:
         for label, pattern in JS_PATTERNS:
             for match in pattern.finditer(text):
                 self._ingest_candidate(match.group("path"), base_url, label, report)
+        # AWS S3 bucket references the page/JS points at: not API endpoints, but
+        # exactly what the S3 misconfig scanner consumes. Bounded so a hostile
+        # page cannot make the scan probe an unbounded list of buckets.
+        if len(report.cloud_assets) < self.cfg.max_js_files:
+            for match in S3_REFERENCE_RE.finditer(text):
+                report.cloud_assets.add(match.group(0))
+                if len(report.cloud_assets) >= self.cfg.max_js_files:
+                    break
         if scan_chunks:
             for match in JS_CHUNK_SRC.finditer(text):
                 enqueue(match.group(1), base_url)
