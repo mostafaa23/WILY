@@ -1742,6 +1742,23 @@ async def _run_cloud_scanners(
             continue
         seen_hosts.add(h)
         hosts.append(h)
+
+    # Per-host origin (scheme://host[:port]) for the port-sensitive per-host
+    # scanners (TLS, php2shell): prefer an origin seen among the discovered
+    # endpoints, so a service on a NON-STANDARD port (e.g. :8443) is probed on
+    # that port instead of only the default. Hosts with no discovered endpoint
+    # (auth-wall / dead) fall back to the scan's scheme + default port. Takeover
+    # is DNS/CNAME-based, so it stays keyed on the bare hostname below.
+    default_scheme = "http" if allow_local else "https"
+    host_origin: dict[str, str] = {}
+    for ep in endpoints:
+        p = urlparse(ep)
+        eh = (p.hostname or "").strip().lower()
+        if eh and eh in seen_hosts and eh not in host_origin and p.netloc:
+            host_origin[eh] = f"{p.scheme}://{p.netloc}"
+    for h in hosts:
+        host_origin.setdefault(h, f"{default_scheme}://{h}")
+
     for host in hosts:
         try:
             found = await run_scanner(
@@ -1765,10 +1782,13 @@ async def _run_cloud_scanners(
     # targets (the scanner refuses private/loopback addresses anyway).
     if not allow_local:
         for host in hosts:
+            tls_parts = urlparse(host_origin[host])
+            # Use the discovered HTTPS port if any; otherwise the default 443.
+            tls_port = tls_parts.port if (tls_parts.scheme == "https" and tls_parts.port) else 443
             try:
                 found = await run_scanner(
                     TlsConfigScanner(scope_manager=scope),
-                    TlsConfigTarget(host=host),
+                    TlsConfigTarget(host=host, port=tls_port),
                 )
                 all_findings += found
                 scanned.add(("tls_config", host))
@@ -1784,7 +1804,6 @@ async def _run_cloud_scanners(
     # memory-corruption / use-after-free bug. The opt-in active behavioral
     # confirmation (--php-shell-confirm) is gated and default-off; it is never
     # reachable without that flag.
-    php_scheme = "http" if allow_local else "https"
     for host in hosts:
         try:
             found = await run_scanner(
@@ -1794,7 +1813,7 @@ async def _run_cloud_scanners(
                     confirm_exploit=php_shell_confirm,
                 ),
                 PhpShellTarget(
-                    url=f"{php_scheme}://{host}",
+                    url=host_origin[host],
                     attempt_active_confirmation=php_shell_confirm,
                 ),
             )

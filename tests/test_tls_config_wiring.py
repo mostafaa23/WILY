@@ -64,3 +64,37 @@ async def test_tls_config_skipped_for_allow_local(monkeypatch):
         confirm_s3_writes=False,
     )
     assert not any(name == "tls_config" for name, _ in ran)
+
+
+@pytest.mark.asyncio
+async def test_perhost_scanners_respect_discovered_port(monkeypatch):
+    """A service discovered on a non-standard port is probed on THAT port:
+    php_shell's target URL carries it, and tls_config uses it instead of 443."""
+    captured: list[tuple[str, object]] = []
+
+    async def fake_run_scanner(scanner, target):
+        captured.append((getattr(scanner, "name", ""), target))
+        return []
+
+    monkeypatch.setattr(scan_all, "run_scanner", fake_run_scanner)
+    scope = ScopeManager("example.com")
+    await scan_all._run_cloud_scanners(
+        all_findings=[],
+        scanned=set(),
+        s3_scan_targets={},
+        endpoints=["https://example.com:8443/api/v1"],
+        imported=None,
+        buckets=(),
+        root_domain="example.com",
+        scope=scope,
+        http_engine=HttpEngine(scope_manager=scope),
+        rate_limiter=None,
+        allow_local=False,
+        confirm_s3_writes=False,
+    )
+    php_targets = [t for n, t in captured if n == "php_shell"]
+    assert php_targets and any(
+        getattr(t, "url", "").endswith(":8443") for t in php_targets
+    )
+    tls_targets = [t for n, t in captured if n == "tls_config"]
+    assert tls_targets and any(getattr(t, "port", None) == 8443 for t in tls_targets)
