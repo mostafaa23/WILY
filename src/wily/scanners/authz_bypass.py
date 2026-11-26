@@ -93,6 +93,25 @@ class AuthzBypassTarget:
     # keyword list to guess the app's wording. Opt-in: None disables it.
     soft_404_probe_url: str | None = None
     soft_404_similarity_threshold: float = 0.85
+    # --- Catch-all suppression: a host that answers a success status with the
+    # *same body* for a GET read and for destructive verbs
+    # (POST/PUT/DELETE/PATCH) is serving one static page regardless of the
+    # method - a single-page app, a CDN/marketing catch-all, a parked domain -
+    # not an API resource with a missing authorizer. A real API differentiates
+    # methods (405/400/201, different bodies). Suppress missing_authorizer for
+    # such hosts; without this, every catch-all subdomain in a bulk scan is a
+    # false "critical".
+    suppress_catch_all: bool = True
+    catch_all_similarity_threshold: float = 0.9
+    # --- Public-page downgrade: returning 200 to an anonymous GET is the
+    # normal state of the public web, so a lone missing_authorizer is only
+    # treated as critical when something corroborates that the resource is
+    # meant to be protected: an authenticated-baseline match, an API-shaped
+    # response (JSON/XML), or a sibling method that *is* protected (401/403).
+    # An obvious public web page (HTML) with no such signal is not a finding
+    # at all and is dropped; an ambiguous response is kept, but at low
+    # severity instead of critical.
+    downgrade_uncorroborated_public: bool = True
 
 
 class AuthzBypassScanner(BaseScanner):
@@ -131,6 +150,72 @@ class AuthzBypassScanner(BaseScanner):
         soft-200 denial, not a real data leak."""
         body = (text or "").lower()
         return any(sig.lower() in body for sig in signatures)
+
+    @staticmethod
+    def _response_content_type(resp) -> str:
+        headers = getattr(resp, "headers", {}) or {}
+        for key, value in headers.items():
+            if str(key).lower() == "content-type":
+                return str(value or "").lower()
+        return ""
+
+    @classmethod
+    def _classify_body(cls, resp) -> str:
+        """Coarse 'is this an API response or a public web page?' classifier.
+
+        Used to decide whether a no-auth 200 is a genuine missing authorizer
+        on an API/protected resource, or just the normal public web (an HTML
+        page that is *supposed* to be readable without a token). Prefers the
+        Content-Type header, falling back to the body's shape when the header
+        is missing or unhelpful. Returns ``"api"``, ``"html"`` or
+        ``"unknown"``.
+        """
+        ctype = cls._response_content_type(resp)
+        if any(tok in ctype for tok in ("json", "xml", "grpc", "protobuf")):
+            return "api"
+        if "html" in ctype:
+            return "html"
+        body = (getattr(resp, "text", "") or "").lstrip()
+        if body[:1] in ("{", "["):
+            return "api"
+        head = body[:256].lower()
+        if head.startswith("<?xml"):
+            return "api"
+        if "<!doctype html" in head or "<html" in head:
+            return "html"
+        return "unknown"
+
+    def _is_catch_all(self, target, unauth_responses, unauth_results) -> bool:
+        """True when the host serves the *same* success response for a GET read
+        and for several destructive verbs, i.e. it ignores the HTTP method
+        entirely (SPA/CDN/parked catch-all), so a no-auth 200 says nothing
+        about a per-resource authorizer."""
+        if not target.suppress_catch_all:
+            return False
+        success = set(target.leak_indicator_statuses)
+        destructive_success = [
+            m for m in target.destructive_methods if unauth_results.get(m) in success
+        ]
+        # One legitimately-open write is not a catch-all; require several
+        # destructive verbs all succeeding before calling the host method-blind.
+        if len(destructive_success) < 2:
+            return False
+        bodies = [
+            (getattr(unauth_responses.get(m), "text", "") or "")
+            for m, status in unauth_results.items()
+            if status in success and unauth_responses.get(m) is not None
+        ]
+        bodies = [b for b in bodies if b.strip()]
+        if len(bodies) < 2:
+            return False
+        ref = bodies[0]
+        try:
+            return all(
+                self.http.similarity(ref, other) >= target.catch_all_similarity_threshold
+                for other in bodies[1:]
+            )
+        except Exception:
+            return False
 
     def _resolve_methods(self, target: AuthzBypassTarget) -> list[str]:
         methods = list(target.methods_to_test)
@@ -190,6 +275,18 @@ class AuthzBypassScanner(BaseScanner):
             m for m, status in unauthenticated_results.items()
             if status in target.leak_indicator_statuses
         ]
+        # A host that returns the same success page for GET and for destructive
+        # verbs ignores the method entirely (catch-all) - a no-auth 200 there is
+        # not a missing authorizer. Drop every candidate so it is neither
+        # reported nor fed into method_inconsistency below.
+        if self._is_catch_all(target, unauth_responses, unauthenticated_results):
+            candidate_methods = []
+        # Whether *any* method on this resource is actually guarded (401/403):
+        # evidence that the resource is meant to be protected, which keeps a
+        # leaking sibling method at critical severity.
+        has_protected_method = any(
+            status in (401, 403) for status in unauthenticated_results.values()
+        )
         leaking_methods: list[str] = []
 
         for method in candidate_methods:
@@ -223,8 +320,6 @@ class AuthzBypassScanner(BaseScanner):
                     # a real leak of this specific resource's data.
                     continue
 
-            leaking_methods.append(method)
-
             # Confidence is grounded against an authenticated baseline when one
             # is available: if the unauthenticated body matches what a valid
             # token returns, the leak is confirmed (raise confidence); if it
@@ -246,11 +341,37 @@ class AuthzBypassScanner(BaseScanner):
                     elif body_similarity < 0.3:
                         confidence = 0.5
 
+            # Is this really a missing authorizer, or just the public web? A
+            # no-auth 200 is only critical when something says the resource is
+            # meant to be protected: its body matches an authenticated baseline,
+            # it is an API-shaped (JSON/XML) response, or a sibling method on
+            # the same resource is itself guarded. A plain public HTML page with
+            # none of these is the web's default behaviour, not a vulnerability.
+            response_class = self._classify_body(resp)
+            corroborated = (
+                (body_similarity is not None and body_similarity >= 0.85)
+                or response_class == "api"
+                or has_protected_method
+            )
+            severity = "critical"
+            if target.downgrade_uncorroborated_public and not corroborated:
+                if response_class == "html":
+                    # A public web page returning 200 to an anonymous GET is
+                    # expected - not a missing authorizer at all. Drop it, and
+                    # keep it out of method_inconsistency too.
+                    continue
+                # Ambiguous (neither clearly an API nor clearly a web page):
+                # keep a trace, but as a low-severity signal, not a critical.
+                severity = "low"
+                confidence = min(confidence, 0.25)
+
+            leaking_methods.append(method)
+
             findings.append(
                 Finding(
                     asset=target.url,
                     category="authz-bypass-missing-authorizer",
-                    severity="critical",
+                    severity=severity,
                     confidence=confidence,
                     discovery_source="scanner",
                     evidence={
@@ -259,6 +380,8 @@ class AuthzBypassScanner(BaseScanner):
                         "response_status": unauthenticated_results[method],
                         "body_similarity_to_authenticated": body_similarity,
                         "body_similarity_to_soft_404_baseline": soft_404_similarity,
+                        "response_class": response_class,
+                        "corroborated": corroborated,
                         "all_methods_tested": unauthenticated_results,
                     },
                     remediation=(
