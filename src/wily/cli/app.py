@@ -164,6 +164,17 @@ def scan_command(
             "own/control."
         ),
     ),
+    php_shell_confirm: bool = typer.Option(
+        False, "--php-shell-confirm/--no-php-shell-confirm",
+        help=(
+            "Enable the OPT-IN active php2shell (CVE-2026-109618/109619) "
+            "behavioral check. OFF by default. The automatic scan already "
+            "detects php2shell safely from the PHP version banner and needs no "
+            "flag; this flag additionally sends ONE benign upload-progress "
+            "request (no memory-corruption payload) to corroborate the "
+            "session.upload_progress trigger surface is reachable."
+        ),
+    ),
     use_rules: bool = typer.Option(
         False, "--rules/--no-rules",
         help=(
@@ -594,6 +605,7 @@ def scan_command(
                 confirm_owned_infra=confirm_owned_infra,
                 confirm_s3_writes=confirm_s3_writes,
                 s3_lab_write=s3_lab_write,
+                php_shell_confirm=php_shell_confirm,
                 probe_live=probe_live,
                 cloud_enum=cloud_enum,
                 cloud_keywords=cloud_keyword or [],

@@ -95,6 +95,7 @@ from wily.scanners.iam_privesc import (
 )
 from wily.scanners.jwt_secret import build_weak_hs256_finding, recover_hs256_secret
 from wily.scanners.jwt_tamper import JwtTamperScanner, JwtTarget
+from wily.scanners.php_shell import PhpShellScanner, PhpShellTarget
 from wily.scanners.rule_scanner import RuleScanner, RuleScanTarget
 from wily.scanners.s3_bucket import S3BucketScanner, S3BucketTarget, s3_host_for
 from wily.scanners.secret_scan import (
@@ -888,6 +889,7 @@ async def run_full_scan(
     endpoint_concurrency: int = _DEFAULT_ENDPOINT_CONCURRENCY,
     target_timeout: float | None = _DEFAULT_TARGET_TIMEOUT,
     extra_findings: list | None = None,
+    php_shell_confirm: bool = False,
 ) -> list:
     # Seeded with any pre-computed findings (e.g. the once-per-run opt-in
     # probes) so they are triaged and written into this report like the rest.
@@ -1182,6 +1184,7 @@ async def run_full_scan(
         s3_lab_write=s3_lab_write,
         discovered_s3_refs=discovered_s3_refs,
         discovered_js=discovered_js,
+        php_shell_confirm=php_shell_confirm,
     )
 
     # --- Cloud resource enumeration (cloud_enum-style). Opt-in via --cloud-enum:
@@ -1597,6 +1600,7 @@ async def _run_cloud_scanners(
     s3_lab_write: bool = False,
     discovered_s3_refs: tuple[str, ...] = (),
     discovered_js: tuple[str, ...] = (),
+    php_shell_confirm: bool = False,
 ) -> None:
     """Run the Phase 3 cloud scanners and fold their findings into the run.
 
@@ -1772,6 +1776,36 @@ async def _run_cloud_scanners(
                     console.print(f"[cyan]    [*][/cyan] TLS config on {host}: {len(found)} finding(s).")
             except Exception as e:
                 console.print(f"[yellow]    [!][/yellow] TLS config scan failed for {host}: {e}")
+
+    # ---- php2shell / PHP-to-shell exposure (always-on, SAFE detection) -----
+    # The automatic path is non-destructive: it reads the PHP version banner
+    # the server advertises (a single GET) and does a GET presence check for
+    # the classic eval-stdin.php PHP-to-shell path. It NEVER triggers the
+    # memory-corruption / use-after-free bug. The opt-in active behavioral
+    # confirmation (--php-shell-confirm) is gated and default-off; it is never
+    # reachable without that flag.
+    php_scheme = "http" if allow_local else "https"
+    for host in hosts:
+        try:
+            found = await run_scanner(
+                PhpShellScanner(
+                    scope_manager=scope,
+                    http_engine=http_engine,
+                    confirm_exploit=php_shell_confirm,
+                ),
+                PhpShellTarget(
+                    url=f"{php_scheme}://{host}",
+                    attempt_active_confirmation=php_shell_confirm,
+                ),
+            )
+            all_findings += found
+            scanned.add(("php_shell", host))
+            if found:
+                console.print(f"[cyan]    [*][/cyan] php2shell exposure on {host}: {len(found)} finding(s).")
+        except ScannerConfirmationError as e:
+            console.print(f"[yellow]    [!][/yellow] php2shell active check skipped: {e}")
+        except Exception as e:
+            console.print(f"[yellow]    [!][/yellow] php2shell scan failed for {host}: {e}")
 
 
 def _provider_engine_factory(allow_local: bool, rate_limiter, timeout: float = 10.0):
