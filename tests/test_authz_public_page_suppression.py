@@ -178,30 +178,49 @@ def test_ambiguous_response_downgraded_to_low():
     assert ma.evidence["response_class"] == "unknown"
 
 
-# --------------------------------------------------------- corroboration paths
+# ------------------------- public page that rejects writes (real-world FP)
 
 
-def test_html_body_with_protected_sibling_stays_critical():
-    """GET returns HTML (200) but POST on the same resource is protected (401):
-    the resource is clearly meant to be guarded, so the open GET is a real
-    inconsistency and stays critical even though its body is HTML."""
+def test_public_html_page_that_rejects_writes_is_not_flagged():
+    """The real careers.example.com pattern: GET=200 HTML (a public page) and
+    every write verb rejected with 403. A server declining POST/PUT/DELETE is
+    NOT an authorization control, so this must produce NEITHER a missing-
+    authorizer NOR a method-inconsistency finding. (It used to false-positive
+    as two criticals via a 'sibling method is protected' heuristic.)"""
 
     def responder(method, url, headers):
-        if method == "GET":
-            return _Resp(200, "<html><body>leaked page content</body></html>")
-        if method == "POST":
-            return _Resp(401, '{"error":"unauthorized"}')
-        return _Resp(404, "")
+        if method in ("GET", "HEAD"):
+            return _Resp(200, "<!doctype html><html><body>Careers</body></html>")
+        return _Resp(403, "forbidden")
 
     target = AuthzBypassTarget(
-        url="https://app.example.com/resource",
+        url="https://careers.example.com/",
+        probe_authorizer_fail_open=False,
+    )
+    findings = _scanner(responder).run(target)
+    assert [f for f in findings if f.category == "authz-bypass-missing-authorizer"] == []
+    assert [f for f in findings if f.category == "authz-bypass-method-inconsistency"] == []
+
+
+def test_unauthenticated_write_is_critical_regardless_of_body():
+    """An accepted UNAUTHENTICATED write (POST=200) is a real finding even when
+    its response is HTML, not API-shaped: a state-changing verb ran with no
+    credential. Safe-method public-page suppression must never weaken this."""
+
+    def responder(method, url, headers):
+        if method in ("GET", "HEAD"):
+            return _Resp(401, "unauthorized")
+        return _Resp(200, "<html>created</html>")  # write accepted, HTML body
+
+    target = AuthzBypassTarget(
+        url="https://api.example.com/orders",
         destructive_methods=["POST"],
         probe_authorizer_fail_open=False,
     )
     findings = _missing_authorizer(_scanner(responder).run(target))
-    assert findings
-    assert findings[0].severity == "critical"
-    assert findings[0].evidence["corroborated"] is True
+    assert any(
+        f.severity == "critical" and f.evidence["method"] == "POST" for f in findings
+    )
 
 
 def test_html_content_type_header_overrides_jsonish_body():

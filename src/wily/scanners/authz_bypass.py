@@ -281,12 +281,6 @@ class AuthzBypassScanner(BaseScanner):
         # reported nor fed into method_inconsistency below.
         if self._is_catch_all(target, unauth_responses, unauthenticated_results):
             candidate_methods = []
-        # Whether *any* method on this resource is actually guarded (401/403):
-        # evidence that the resource is meant to be protected, which keeps a
-        # leaking sibling method at critical severity.
-        has_protected_method = any(
-            status in (401, 403) for status in unauthenticated_results.values()
-        )
         leaking_methods: list[str] = []
 
         for method in candidate_methods:
@@ -341,29 +335,37 @@ class AuthzBypassScanner(BaseScanner):
                     elif body_similarity < 0.3:
                         confidence = 0.5
 
-            # Is this really a missing authorizer, or just the public web? A
-            # no-auth 200 is only critical when something says the resource is
-            # meant to be protected: its body matches an authenticated baseline,
-            # it is an API-shaped (JSON/XML) response, or a sibling method on
-            # the same resource is itself guarded. A plain public HTML page with
-            # none of these is the web's default behaviour, not a vulnerability.
+            # Is this really a missing authorizer, or just the public web?
             response_class = self._classify_body(resp)
-            corroborated = (
-                (body_similarity is not None and body_similarity >= 0.85)
-                or response_class == "api"
-                or has_protected_method
-            )
-            severity = "critical"
-            if target.downgrade_uncorroborated_public and not corroborated:
-                if response_class == "html":
-                    # A public web page returning 200 to an anonymous GET is
-                    # expected - not a missing authorizer at all. Drop it, and
-                    # keep it out of method_inconsistency too.
-                    continue
-                # Ambiguous (neither clearly an API nor clearly a web page):
-                # keep a trace, but as a low-severity signal, not a critical.
-                severity = "low"
-                confidence = min(confidence, 0.25)
+            if method in _DESTRUCTIVE_METHODS:
+                # An accepted UNAUTHENTICATED write/delete is a real finding on
+                # its own, whatever the body looks like: the server executed a
+                # state-changing verb with no credential.
+                severity = "critical"
+                corroborated = True
+            else:
+                # A safe-method (GET/HEAD) 200 is the public web's default, so it
+                # is only critical with positive evidence the resource is a
+                # protected API: an authenticated-baseline match, or an
+                # API-shaped (JSON/XML) response. A sibling method returning
+                # 401/403 is deliberately NOT treated as such evidence - public
+                # pages routinely reject POST/PUT/DELETE with 403/405, so that
+                # signal would flag every static page that declines writes (the
+                # classic false positive, e.g. a public careers/marketing page).
+                # An obvious public HTML page is dropped; an ambiguous response
+                # is kept at low severity.
+                corroborated = (
+                    (body_similarity is not None and body_similarity >= 0.85)
+                    or response_class == "api"
+                )
+                severity = "critical"
+                if target.downgrade_uncorroborated_public and not corroborated:
+                    if response_class == "html":
+                        # Public web page - not a missing authorizer. Drop it,
+                        # and keep it out of method_inconsistency too.
+                        continue
+                    severity = "low"
+                    confidence = min(confidence, 0.25)
 
             leaking_methods.append(method)
 
