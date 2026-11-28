@@ -31,6 +31,7 @@ they reach a report.
 | Account enumeration (timing) | `timing_enum.py` | 1 |
 | TLS / certificate configuration | `tls_config.py` | 6 |
 | Token / session-ID randomness | `token_entropy.py` | 3 |
+| HTTP security headers | `security_headers.py` | 1 (grouped per origin) |
 | Declarative YAML rules | `templates/rules/` | 3 |
 
 ---
@@ -197,6 +198,26 @@ Uses NIST SP 800-90B min-entropy.
 | `token-predictable-sequential` | Tokens are sequential / predictable |
 | `token-collision` | Repeated (colliding) tokens observed |
 | `token-low-entropy` | Token randomness below threshold |
+
+## 14. HTTP security headers — `scanners/security_headers.py`
+
+`security-misconfig-headers` — one grouped finding per origin (a single
+read-only GET). Maps to **OWASP A02 — Security Misconfiguration**. Evidence
+lists:
+
+- `missing` — `Content-Security-Policy`, `X-Frame-Options` (satisfied by CSP
+  `frame-ancestors`), `X-Content-Type-Options`, `Referrer-Policy`,
+  `Permissions-Policy`, and `Strict-Transport-Security` on HTTPS responses.
+  The document-only headers are checked only on HTML responses.
+- `weak` — CSP `script-src`/`default-src` allowing `'unsafe-inline'` (without
+  nonce/hash), `'unsafe-eval'` or `*`; report-only CSP; non-`nosniff`
+  `X-Content-Type-Options`; `Referrer-Policy: unsafe-url`; HSTS `max-age`
+  under 180 days.
+- `info_disclosure` — `Server` / `X-Powered-By` with a version, and the
+  ASP.NET version headers.
+
+Severity is `medium` when CSP, HSTS, frame protection or nosniff is missing or
+weak, otherwise `low`.
 
 ---
 

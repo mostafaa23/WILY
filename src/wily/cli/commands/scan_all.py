@@ -103,6 +103,7 @@ from wily.scanners.secret_scan import (
     SecretScanTarget,
     SecretSource,
 )
+from wily.scanners.security_headers import SecurityHeadersScanner, SecurityHeadersTarget
 from wily.scanners.session_fixation import (
     SessionFixationScanner,
     SessionFixationTarget,
@@ -1825,6 +1826,27 @@ async def _run_cloud_scanners(
             console.print(f"[yellow]    [!][/yellow] php2shell active check skipped: {e}")
         except Exception as e:
             console.print(f"[yellow]    [!][/yellow] php2shell scan failed for {host}: {e}")
+
+    # ---- Missing / weak HTTP security headers (always-on, read-only) -------
+    # One GET of each host's origin (honouring a discovered non-standard port
+    # via host_origin) and a pure inspection of the response headers. Results
+    # for a host are grouped into a single finding.
+    for host in hosts:
+        try:
+            found = await run_scanner(
+                SecurityHeadersScanner(scope_manager=scope, http_engine=http_engine),
+                SecurityHeadersTarget(origin=host_origin[host]),
+            )
+            all_findings += found
+            scanned.add(("security_headers", host))
+            if found:
+                console.print(
+                    f"[cyan]    [*][/cyan] Security headers on {host}: "
+                    f"{len(found[0].evidence.get('missing', []))} missing, "
+                    f"{len(found[0].evidence.get('weak', {}))} weak."
+                )
+        except Exception as e:
+            console.print(f"[yellow]    [!][/yellow] Security headers scan failed for {host}: {e}")
 
 
 def _provider_engine_factory(allow_local: bool, rate_limiter, timeout: float = 10.0):
